@@ -160,6 +160,10 @@ rate_limiter = RateLimiter()  # defaults: 8 req / 60s
 
 # ---------------- ENHANCED UTILS ----------------
 def fmt_price(p: float) -> str:
+    try:
+        p = float(p)
+    except:
+        return str(p)
     if abs(p) < 0.001:
         return f"{p:.8f}"
     elif abs(p) < 1:
@@ -590,7 +594,7 @@ def plot_simple_chart(symbol: str, candles: List[List], signal: Dict) -> str:
 @asynccontextmanager
 async def get_session():
     """Context manager for aiohttp session with retry logic"""
-    connector = aiohttp.TCPConnector(limit=40, ttl_dns_cache=300, use_dns_cache=True)
+    connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300, use_dns_cache=True)
     timeout = aiohttp.ClientTimeout(total=30, connect=10)
     
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
@@ -607,7 +611,7 @@ async def fetch_json_with_retry(session: aiohttp.ClientSession, url: str, max_re
                     return await response.json()
                 elif response.status == 429:  # Rate limited
                     wait_time = 2 ** attempt
-                    logger.warning(f"Rate limited, waiting {wait_time}s")
+                    logger.warning(f"Rate limited by remote, waiting {wait_time}s (attempt {attempt+1})")
                     await asyncio.sleep(wait_time)
                 else:
                     logger.warning(f"HTTP {response.status} for {url}")
@@ -866,6 +870,51 @@ class PerformanceMonitor:
 
 monitor = PerformanceMonitor()
 
+# ---------------- PROCESS SIGNAL (FIXED) ----------------
+async def process_signal(session: aiohttp.ClientSession, signal: Dict):
+    """Process and send individual signal"""
+    symbol = signal["symbol"]
+    rr_ratio = signal.get("risk_reward", 0)
+    indicators = signal.get("indicators", {})
+
+    message = (f"🎯 *{symbol} {signal['side']} SIGNAL*\n\n"
+              f"💰 Entry: `{fmt_price(signal['entry'])}`\n"
+              f"🛑 Stop Loss: `{fmt_price(signal['sl'])}`\n"
+              f"🎯 Take Profit: `{fmt_price(signal['tp'])}`\n"
+              f"📊 Confidence: *{signal['confidence']:.1f}%*\n"
+              f"⚖️ Risk/Reward: *{rr_ratio:.2f}*\n\n"
+              f"📈 *Indicators:*\n"
+              f"• RSI: {indicators.get('rsi', 0):.1f}\n"
+              f"• EMA9: {fmt_price(indicators.get('ema_9', 0))}\n"
+              f"• EMA21: {fmt_price(indicators.get('ema_21', 0))}\n\n"
+              f"📝 *Reason:* {signal['reason'][:400]}\n\n"
+              f"⏰ {datetime.now().strftime('%H:%M:%S UTC')}")
+
+    try:
+        # Send chart if exists
+        chart_path = signal.get("chart_path")
+        if chart_path and os.path.exists(chart_path):
+            await telegram.send_photo(session, message, chart_path)
+        else:
+            await telegram.send_message(session, message)
+
+        # Save to DB (safe guard required fields)
+        if all(k in signal for k in ("symbol","side","entry","sl","tp","confidence","reason")):
+            db.save_signal({
+                "symbol": symbol,
+                "side": signal["side"],
+                "entry": signal["entry"],
+                "sl": signal["sl"],
+                "tp": signal["tp"],
+                "confidence": signal["confidence"],
+                "reason": signal["reason"]
+            })
+        logger.info(f"✅ Signal sent: {symbol} {signal['side']} @ {fmt_price(signal['entry'])} (Conf: {signal['confidence']:.1f}%, R/R: {rr_ratio:.2f})")
+
+    except Exception as e:
+        logger.error(f"Failed to process/send signal for {symbol}: {e}")
+        logger.error(traceback.format_exc())
+
 # ---------------- MAIN ENHANCED LOOP ----------------
 async def enhanced_trading_loop():
     """Main enhanced trading loop with better error handling"""
@@ -939,24 +988,13 @@ async def enhanced_trading_loop():
                 # Exponential backoff on errors
                 await asyncio.sleep(min(300, 30 * 2**(monitor.error_count % 4)))
 
-async def process_signal(session: aiohttp.ClientSession, signal: Dict):
-    """Process and send individual signal"""
-    symbol = signal["symbol"]
-    
-    # Format message
-    rr_ratio = signal.get("risk_reward", 0)
-    indicators = signal.get("indicators", {})
-    
-    message = (f"🎯 *{symbol} {signal['side']} SIGNAL*\n\n"
-              f"💰 Entry: `{fmt_price(signal['entry'])}`\n"
-              f"🛑 Stop Loss: `{fmt_price(signal['sl'])}`\n"
-              f"🎯 Take Profit: `{fmt_price(signal['tp'])}`\n"
-              f"📊 Confidence: *{signal['confidence']:.1f}%*\n"
-              f"⚖️ Risk/Reward: *{rr_ratio:.2f}*\n\n"
-              f"📈 *Indicators:*\n"
-              f"• RSI: {indicators.get('rsi', 0):.1f}\n"
-              f"• EMA9: {fmt_price(indicators.get('ema_9', 0))}\n"
-              f"• EMA21: {fmt_price(indicators.get('ema_21', 0))}\n\n"
-              f"📝 *Reason:* {signal['reason'][:200]}...\n\n"
-              f"⏰ {datetime.now().strftime('%H:%M:%S UTC')}")
-
+# ---------------- ENTRY ----------------
+if __name__ == "__main__":
+    try:
+        logger.info("Starting Enhanced Crypto Trading Bot v5.0")
+        asyncio.run(enhanced_trading_loop())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        logger.error(traceback.format_exc())
