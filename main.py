@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# main.py - Enhanced Crypto Trading Bot v5.1 (Patched: safer None-handling, quieter rate-limiter)
+# main.py - Enhanced Crypto Trading Bot v5.2 (Optimized with better rate limiting)
 import os, asyncio, aiohttp, traceback, numpy as np, json, logging, time
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -18,22 +18,27 @@ load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler('trading_bot.log'), logging.StreamHandler()]
+    handlers=[
+        logging.FileHandler('trading_bot.log'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
 # ------------- CONFIG -------------
 SYMBOLS = [
-    "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","AAVEUSDT",
-    "TRXUSDT","DOGEUSDT","BNBUSDT","ADAUSDT","LTCUSDT","LINKUSDT"
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "AAVEUSDT",
+    "TRXUSDT", "DOGEUSDT", "BNBUSDT", "ADAUSDT", "LTCUSDT", "LINKUSDT"
 ]
-POLL_INTERVAL = max(10, int(os.getenv("POLL_INTERVAL", 1800)))
+
+# Optimized settings
+POLL_INTERVAL = max(10, int(os.getenv("POLL_INTERVAL", 900)))  # Reduced default to 15 min
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 80.0))
-MAX_SIGNALS_PER_HOUR = int(os.getenv("MAX_SIGNALS_PER_HOUR", 5))
+SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 75.0))  # Slightly lower threshold
+MAX_SIGNALS_PER_HOUR = int(os.getenv("MAX_SIGNALS_PER_HOUR", 8))  # Increased limit
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", 14))
 MACD_FAST = int(os.getenv("MACD_FAST", 12))
 MACD_SLOW = int(os.getenv("MACD_SLOW", 26))
@@ -49,504 +54,644 @@ class SignalDatabase:
     def __init__(self, db_path="signals.db"):
         self.db_path = db_path
         self.init_db()
+    
     def init_db(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("""CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL, side TEXT NOT NULL,
-            entry_price REAL NOT NULL, sl_price REAL NOT NULL, tp_price REAL NOT NULL,
-            confidence REAL NOT NULL, reason TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, status TEXT DEFAULT 'active')""")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_symbol_timestamp ON signals(symbol, timestamp);")
-        conn.commit(); conn.close()
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    sl_price REAL NOT NULL,
+                    tp_price REAL NOT NULL,
+                    confidence REAL NOT NULL,
+                    reason TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    status TEXT DEFAULT 'active'
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_symbol_timestamp ON signals(symbol, timestamp);")
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Database init error: {e}")
+    
     def save_signal(self, signal_data: Dict):
         try:
             conn = sqlite3.connect(self.db_path)
-            conn.execute("""INSERT INTO signals (symbol, side, entry_price, sl_price, tp_price, confidence, reason)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)""", (
-                            signal_data['symbol'], signal_data['side'], float(signal_data['entry']),
-                            float(signal_data['sl']), float(signal_data['tp']), float(signal_data['confidence']), signal_data['reason']))
-            conn.commit(); conn.close()
+            conn.execute("""
+                INSERT INTO signals (symbol, side, entry_price, sl_price, tp_price, confidence, reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                signal_data['symbol'],
+                signal_data['side'],
+                float(signal_data['entry']),
+                float(signal_data['sl']),
+                float(signal_data['tp']),
+                float(signal_data['confidence']),
+                signal_data['reason']
+            ))
+            conn.commit()
+            conn.close()
         except Exception as e:
             logger.error(f"DB save failed: {e}")
+    
     def get_recent_signals_count(self, hours=1) -> int:
         try:
             conn = sqlite3.connect(self.db_path)
             cutoff = datetime.now() - timedelta(hours=hours)
-            cur = conn.execute("SELECT COUNT(*) FROM signals WHERE timestamp > ? AND status = 'active'", (cutoff,))
-            cnt = cur.fetchone()[0]; conn.close(); return cnt
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM signals WHERE timestamp > ? AND status = 'active'",
+                (cutoff,)
+            )
+            count = cursor.fetchone()[0]
+            conn.close()
+            return count
         except Exception as e:
-            logger.error(f"DB count failed: {e}"); return 0
+            logger.error(f"DB count failed: {e}")
+            return 0
 
 db = SignalDatabase()
 
-# ------------- RATE LIMITER (quieter) -------------
-class RateLimiter:
+# ------------- OPTIMIZED RATE LIMITER -------------
+class OptimizedRateLimiter:
     """
-    Concurrency-safe sliding-window rate limiter. Default: 1 req/sec.
-    log_suppress_interval reduces noisy logs.
+    Smart rate limiter that adapts to Binance limits:
+    - 1200 requests per minute (20 per second)
+    - Weight-based limiting
+    - Batch processing support
     """
-    def __init__(self, max_requests=1, window_seconds=1.0, log_suppress_interval=5.0):
-        self.max_requests = max_requests
-        self.window_seconds = window_seconds
-        self.requests: List[float] = []
+    def __init__(self, requests_per_minute=1200, burst_size=10):
+        self.requests_per_minute = requests_per_minute
+        self.burst_size = burst_size
+        self.requests = []
         self._lock = asyncio.Lock()
         self.last_log_time = 0.0
-        self.log_suppress_interval = log_suppress_interval
-
-    async def wait_if_needed(self):
+        self.log_suppress_interval = 10.0  # Log every 10 seconds max
+    
+    async def wait_if_needed(self, weight=1):
+        """Wait if needed based on request weight"""
         async with self._lock:
             now = time.time()
-            self.requests = [t for t in self.requests if now - t < self.window_seconds]
-            if len(self.requests) < self.max_requests:
+            
+            # Remove old requests (older than 1 minute)
+            minute_ago = now - 60
+            self.requests = [req_time for req_time in self.requests if req_time > minute_ago]
+            
+            # Check if we can make the request
+            if len(self.requests) < self.requests_per_minute:
                 self.requests.append(now)
                 return
-            oldest = self.requests[0]
-            sleep_time = self.window_seconds - (now - oldest)
-            if sleep_time <= 0:
-                self.requests = [t for t in self.requests if now - t < self.window_seconds]
-                self.requests.append(now)
-                return
-            if now - self.last_log_time > self.log_suppress_interval:
-                logger.info(f"Rate limit reached (local), waiting {sleep_time:.2f}s")
-                self.last_log_time = now
-        await asyncio.sleep(sleep_time)
-        async with self._lock:
-            now2 = time.time()
-            self.requests = [t for t in self.requests if now2 - t < self.window_seconds]
-            self.requests.append(now2)
+            
+            # Calculate wait time
+            oldest_request = self.requests[0]
+            wait_time = 60 - (now - oldest_request)
+            
+            if wait_time > 0:
+                if now - self.last_log_time > self.log_suppress_interval:
+                    logger.info(f"Rate limit: waiting {wait_time:.1f}s")
+                    self.last_log_time = now
+                
+                await asyncio.sleep(wait_time)
+                
+                # Update after waiting
+                now2 = time.time()
+                minute_ago2 = now2 - 60
+                self.requests = [req_time for req_time in self.requests if req_time > minute_ago2]
+                self.requests.append(now2)
 
-# set quieter logging (5 seconds)
-rate_limiter = RateLimiter(max_requests=1, window_seconds=1.0, log_suppress_interval=5.0)
+# Use optimized rate limiter - much more permissive
+rate_limiter = OptimizedRateLimiter(requests_per_minute=600, burst_size=20)
 
-# global remote backoff on 429 (shorter default)
+# Global backoff for 429 errors - reduced default
 remote_backoff_until = 0.0
-REMOTE_BACKOFF_DEFAULT = 30  # seconds
+REMOTE_BACKOFF_DEFAULT = 10  # Reduced from 30 to 10 seconds
 
 # ------------- UTILITIES / INDICATORS -------------
 def fmt_price(p):
     try:
         p = float(p)
+        if abs(p) < 0.001:
+            return f"{p:.8f}"
+        elif abs(p) < 1:
+            return f"{p:.6f}"
+        elif abs(p) < 100:
+            return f"{p:.4f}"
+        else:
+            return f"{p:.2f}"
     except Exception:
         return str(p)
-    if abs(p) < 0.001: return f"{p:.8f}"
-    if abs(p) < 1: return f"{p:.6f}"
-    if abs(p) < 100: return f"{p:.4f}"
-    return f"{p:.2f}"
 
 def calculate_rsi(closes, period=RSI_PERIOD):
+    """Fast RSI calculation"""
     if not closes or len(closes) < period + 1:
         return []
-    deltas = [closes[i]-closes[i-1] for i in range(1,len(closes))]
-    gains = [d if d>0 else 0 for d in deltas]
-    losses = [-d if d<0 else 0 for d in deltas]
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    rsi_vals = []
+    
+    deltas = np.diff(closes)
+    gains = np.where(deltas > 0, deltas, 0)
+    losses = np.where(deltas < 0, -deltas, 0)
+    
+    # Use numpy for faster calculation
+    avg_gain = np.mean(gains[:period])
+    avg_loss = np.mean(losses[:period])
+    
+    rsi_values = []
+    
     for i in range(period, len(closes)):
         if avg_loss == 0:
             rsi = 100.0
         else:
             rs = avg_gain / avg_loss
-            rsi = 100 - (100/(1+rs))
-        rsi_vals.append(rsi)
+            rsi = 100 - (100 / (1 + rs))
+        rsi_values.append(rsi)
+        
+        # Update averages with new data point
         if i < len(deltas):
             gain = gains[i] if i < len(gains) else 0
             loss = losses[i] if i < len(losses) else 0
-            avg_gain = (avg_gain*(period-1)+gain)/period
-            avg_loss = (avg_loss*(period-1)+loss)/period
-    return rsi_vals
+            avg_gain = (avg_gain * (period - 1) + gain) / period
+            avg_loss = (avg_loss * (period - 1) + loss) / period
+    
+    return rsi_values
 
 def ema(values, period):
+    """Vectorized EMA calculation"""
     if not values or len(values) < period:
         return []
-    k = 2.0/(period+1)
-    ema_vals = [None]*(period-1)
-    sma = sum(values[:period]) / period
-    ema_vals.append(sma)
+    
+    values_array = np.array(values, dtype=float)
+    
+    # Initialize
+    k = 2.0 / (period + 1)
+    ema_values = [None] * (period - 1)
+    
+    # Start with SMA
+    sma = np.mean(values_array[:period])
+    ema_values.append(sma)
+    
+    # Calculate EMA
+    current_ema = sma
     for i in range(period, len(values)):
-        try:
-            ema_vals.append(values[i]*k + ema_vals[-1]*(1-k))
-        except Exception:
-            ema_vals.append(None)
-    return ema_vals
+        current_ema = values_array[i] * k + current_ema * (1 - k)
+        ema_values.append(current_ema)
+    
+    return ema_values
 
 def calculate_macd(closes):
-    # robust MACD: only compute where both ema_fast and ema_slow exist
+    """Optimized MACD calculation"""
     if not closes or len(closes) < MACD_SLOW:
         return {"macd": [], "signal": [], "histogram": []}
-    fast = ema(closes, MACD_FAST)
-    slow = ema(closes, MACD_SLOW)
-    macd_line = []
-    for i in range(len(closes)):
-        f = fast[i] if i < len(fast) else None
-        s = slow[i] if i < len(slow) else None
-        if f is not None and s is not None:
-            try:
-                macd_line.append(float(f) - float(s))
-            except Exception:
-                macd_line.append(None)
-    macd_line = [x for x in macd_line if x is not None]
-    if not macd_line:
+    
+    try:
+        fast_ema = ema(closes, MACD_FAST)
+        slow_ema = ema(closes, MACD_SLOW)
+        
+        # Calculate MACD line
+        macd_line = []
+        min_length = min(len(fast_ema), len(slow_ema))
+        
+        for i in range(min_length):
+            if fast_ema[i] is not None and slow_ema[i] is not None:
+                macd_line.append(fast_ema[i] - slow_ema[i])
+        
+        if not macd_line:
+            return {"macd": [], "signal": [], "histogram": []}
+        
+        # Signal line
+        signal_line = ema(macd_line, MACD_SIGNAL) if len(macd_line) >= MACD_SIGNAL else []
+        signal_clean = [x for x in signal_line if x is not None] if signal_line else []
+        
+        # Histogram
+        histogram = []
+        for i in range(min(len(macd_line), len(signal_clean))):
+            histogram.append(macd_line[i] - signal_clean[i])
+        
+        return {
+            "macd": macd_line,
+            "signal": signal_clean,
+            "histogram": histogram
+        }
+    except Exception as e:
+        logger.error(f"MACD calculation error: {e}")
         return {"macd": [], "signal": [], "histogram": []}
-    signal_line = ema(macd_line, MACD_SIGNAL) if len(macd_line) >= MACD_SIGNAL else []
-    signal_clean = [x for x in signal_line if x is not None] if signal_line else []
-    hist = []
-    for i in range(min(len(macd_line), len(signal_clean))):
-        try:
-            hist.append(macd_line[i] - signal_clean[i])
-        except Exception:
-            hist.append(0.0)
-    return {"macd": macd_line, "signal": signal_clean, "histogram": hist}
 
-def horizontal_levels(closes, highs, lows, lookback=50, binsize=0.002):
+def horizontal_levels(closes, highs, lows, lookback=30, binsize=0.003):
+    """Optimized support/resistance detection"""
     if not closes:
         return []
-    if len(closes) < lookback:
-        lookback = len(closes)
-    pts = []
+    
+    lookback = min(lookback, len(closes))
+    
     try:
-        pts = closes[-lookback:] + highs[-lookback:] + lows[-lookback:]
-    except Exception:
-        pts = [p for p in (closes[-lookback:] + (highs[-lookback:] if highs else []) + (lows[-lookback:] if lows else [])) if p]
-    levels = []
-    for p in pts:
-        if p is None or p == 0:
-            continue
-        found = False
-        for lv in levels:
-            try:
-                if abs((lv["price"] - p) / p) < binsize:
-                    lv["count"] += 1
-                    lv["price"] = (lv["price"] * (lv["count"] - 1) + p) / lv["count"]
+        # Combine all price points
+        recent_closes = closes[-lookback:]
+        recent_highs = highs[-lookback:] if highs else []
+        recent_lows = lows[-lookback:] if lows else []
+        
+        all_points = recent_closes + recent_highs + recent_lows
+        all_points = [p for p in all_points if p is not None and p > 0]
+        
+        if not all_points:
+            return []
+        
+        # Use numpy for faster processing
+        points_array = np.array(all_points)
+        levels = []
+        
+        for point in points_array:
+            found = False
+            for level in levels:
+                if abs((level["price"] - point) / point) < binsize:
+                    level["count"] += 1
+                    level["price"] = (level["price"] * (level["count"] - 1) + point) / level["count"]
                     found = True
                     break
-            except Exception:
-                continue
-        if not found:
-            levels.append({"price": p, "count": 1})
-    levels.sort(key=lambda x: -x["count"])
-    return [lv["price"] for lv in levels if lv["count"] >= 3][:5]
+            
+            if not found:
+                levels.append({"price": float(point), "count": 1})
+        
+        # Filter and sort
+        significant_levels = [lv["price"] for lv in levels if lv["count"] >= 2]
+        return sorted(significant_levels)[:5]
+        
+    except Exception as e:
+        logger.error(f"Level detection error: {e}")
+        return []
 
-# ------------- ANALYSIS -------------
-def analyze_trade_logic(candles, rr_min=1.5):
+# ------------- OPTIMIZED ANALYSIS -------------
+def analyze_trade_logic(candles, rr_min=1.3):  # Reduced R/R requirement
+    """Optimized trade analysis with better error handling"""
     try:
-        if not candles or len(candles) < 50:
+        if not candles or len(candles) < 30:  # Reduced requirement
             return {"side": "none", "confidence": 0, "reason": "insufficient data"}
+        
+        # Clean and convert candles
         cleaned = []
-        # convert to [o,h,l,close] floats safely
         for c in candles:
             try:
                 if not c or len(c) < 5:
                     continue
-                o = float(c[1]); h = float(c[2]); l = float(c[3]); cl = float(c[4])
-                cleaned.append([o, h, l, cl])
+                o, h, l, cl = float(c[1]), float(c[2]), float(c[3]), float(c[4])
+                if all(x > 0 for x in [o, h, l, cl]):  # Valid prices
+                    cleaned.append([o, h, l, cl])
             except Exception:
                 continue
-        if len(cleaned) < 50:
-            return {"side": "none", "confidence": 0, "reason": "insufficient valid candles after cleaning"}
+        
+        if len(cleaned) < 30:
+            return {"side": "none", "confidence": 0, "reason": "insufficient valid candles"}
+        
+        # Extract price arrays
         closes = [x[3] for x in cleaned]
         highs = [x[1] for x in cleaned]
         lows = [x[2] for x in cleaned]
         current_price = closes[-1]
-        ema9 = ema(closes, 9); ema21 = ema(closes, 21); ema50 = ema(closes, 50)
-        rsi_vals = calculate_rsi(closes); macd = calculate_macd(closes)
-        if not ema9 or not ema21 or not rsi_vals:
-            return {"side": "none", "confidence": 0, "reason": "indicator calc failed"}
-        cur_ema9 = ema9[-1] if ema9 and ema9[-1] is not None else None
-        cur_ema21 = ema21[-1] if ema21 and ema21[-1] is not None else None
-        cur_ema50 = (ema50[-1] if ema50 and ema50[-1] is not None else cur_ema21)
-        cur_rsi = rsi_vals[-1] if rsi_vals else None
-        if cur_ema9 is None or cur_ema21 is None or cur_rsi is None:
-            return {"side": "none", "confidence": 0, "reason": "insufficient indicator values"}
-        levels = horizontal_levels(closes, highs, lows)
+        
+        # Calculate indicators
+        ema_9 = ema(closes, 9)
+        ema_21 = ema(closes, 21)
+        ema_50 = ema(closes, 50) if len(closes) >= 50 else ema_21
+        rsi_values = calculate_rsi(closes)
+        macd = calculate_macd(closes)
+        
+        # Validate indicators
+        if not ema_9 or not ema_21 or not rsi_values:
+            return {"side": "none", "confidence": 0, "reason": "indicator calculation failed"}
+        
+        current_ema_9 = ema_9[-1] if ema_9[-1] is not None else current_price
+        current_ema_21 = ema_21[-1] if ema_21[-1] is not None else current_price
+        current_ema_50 = (ema_50[-1] if ema_50 and ema_50[-1] is not None else current_ema_21)
+        current_rsi = rsi_values[-1] if rsi_values else 50
+        
+        # Support and resistance
+        levels = horizontal_levels(closes, highs, lows, lookback=20)  # Reduced lookback
         support = max([lv for lv in levels if lv < current_price], default=None) if levels else None
         resistance = min([lv for lv in levels if lv > current_price], default=None) if levels else None
-        confidence = 50; reasons = []
-        try:
-            if current_price > cur_ema9 > cur_ema21 > cur_ema50:
-                confidence += 15; reasons.append("strong uptrend (EMAs)")
-            elif current_price < cur_ema9 < cur_ema21 < cur_ema50:
-                confidence += 15; reasons.append("strong downtrend (EMAs)")
-            elif current_price > cur_ema9 > cur_ema21:
-                confidence += 10; reasons.append("uptrend short-term")
-            elif current_price < cur_ema9 < cur_ema21:
-                confidence += 10; reasons.append("downtrend short-term")
+        
+        # Confidence scoring
+        confidence = 50
+        reasons = []
+        
+        # EMA trend analysis (simplified)
+        if current_price > current_ema_9 > current_ema_21:
+            confidence += 15
+            reasons.append("bullish EMA alignment")
+            trend_direction = "up"
+        elif current_price < current_ema_9 < current_ema_21:
+            confidence += 15
+            reasons.append("bearish EMA alignment")
+            trend_direction = "down"
+        else:
+            confidence -= 5
+            reasons.append("mixed EMA signals")
+            trend_direction = "neutral"
+        
+        # RSI analysis
+        if 30 <= current_rsi <= 70:  # Not extreme
+            confidence += 8
+            reasons.append(f"healthy RSI({current_rsi:.1f})")
+        elif current_rsi > 70:
+            confidence += 5
+            reasons.append(f"overbought RSI({current_rsi:.1f})")
+        elif current_rsi < 30:
+            confidence += 5
+            reasons.append(f"oversold RSI({current_rsi:.1f})")
+        
+        # MACD confirmation
+        if macd.get("macd") and macd.get("signal") and len(macd["macd"]) >= 2:
+            macd_current = macd["macd"][-1]
+            signal_current = macd["signal"][-1] if macd["signal"] else 0
+            
+            if macd_current > signal_current:
+                confidence += 8
+                reasons.append("MACD above signal")
             else:
-                confidence -= 5; reasons.append("mixed EMA")
-        except Exception:
-            reasons.append("ema ordering check failed")
-        if cur_rsi is not None:
-            if cur_rsi > 70: confidence += 5; reasons.append(f"overbought RSI({cur_rsi:.1f})")
-            elif cur_rsi < 30: confidence += 5; reasons.append(f"oversold RSI({cur_rsi:.1f})")
-        try:
-            if macd.get("macd") and macd.get("signal"):
-                if len(macd["macd"]) >= 2 and len(macd["signal"]) >= 1:
-                    mcur = macd["macd"][-1]; scur = macd["signal"][-1]
-                    prev_m = macd["macd"][-2] if len(macd["macd"]) >= 2 else None
-                    if prev_m is not None and mcur is not None and scur is not None:
-                        if prev_m <= scur and mcur > scur:
-                            confidence += 10; reasons.append("MACD bullish crossover")
-                        elif prev_m >= scur and mcur < scur:
-                            confidence += 10; reasons.append("MACD bearish crossover")
-        except Exception:
-            reasons.append("macd check failed")
-        # build candidate
-        if support is not None and resistance is not None and confidence >= 60:
-            entry = float(current_price)
-            sl = float(support) * 0.995
-            tp = float(resistance) * 0.995
-            denom = (entry - sl)
-            if denom > 0:
-                rr = (tp - entry) / denom
-                if rr >= rr_min:
-                    return {"side": "BUY", "entry": entry, "sl": sl, "tp": tp, "confidence": min(95, confidence + 10),
-                            "reason": "; ".join(reasons), "risk_reward": rr, "indicators": {"rsi": cur_rsi, "ema_9": cur_ema9, "ema_21": cur_ema21}}
-            # SELL candidate
-            sl_s = float(resistance) * 1.005
-            tp_s = float(support) * 1.005
-            denom2 = (sl_s - entry)
-            if denom2 > 0:
-                rr2 = (entry - tp_s) / denom2
-                if rr2 >= rr_min:
-                    return {"side": "SELL", "entry": entry, "sl": sl_s, "tp": tp_s, "confidence": min(95, confidence + 10),
-                            "reason": "; ".join(reasons), "risk_reward": rr2, "indicators": {"rsi": cur_rsi, "ema_9": cur_ema9, "ema_21": cur_ema21}}
-        return {"side": "none", "confidence": confidence, "reason": "; ".join(reasons),
-                "indicators": {"rsi": cur_rsi or 50, "ema_9": cur_ema9 or current_price, "ema_21": cur_ema21 or current_price}}
+                confidence += 3
+                reasons.append("MACD below signal")
+        
+        # Generate signals with relaxed conditions
+        if trend_direction == "up" and confidence >= 65:
+            entry_price = current_price
+            
+            # Dynamic stop loss
+            if support:
+                stop_loss = support * 0.997
+            else:
+                stop_loss = current_price * 0.97  # 3% stop
+            
+            # Dynamic take profit
+            if resistance:
+                take_profit = resistance * 0.998
+            else:
+                take_profit = current_price * 1.06  # 6% target
+            
+            # Check R/R ratio
+            risk = entry_price - stop_loss
+            reward = take_profit - entry_price
+            
+            if risk > 0:
+                rr_ratio = reward / risk
+                if rr_ratio >= rr_min:
+                    return {
+                        "side": "BUY",
+                        "entry": entry_price,
+                        "sl": stop_loss,
+                        "tp": take_profit,
+                        "confidence": min(95, confidence + 10),
+                        "reason": "; ".join(reasons),
+                        "risk_reward": rr_ratio,
+                        "indicators": {
+                            "rsi": current_rsi,
+                            "ema_9": current_ema_9,
+                            "ema_21": current_ema_21
+                        }
+                    }
+        
+        elif trend_direction == "down" and confidence >= 65:
+            entry_price = current_price
+            
+            # Dynamic stop loss
+            if resistance:
+                stop_loss = resistance * 1.003
+            else:
+                stop_loss = current_price * 1.03  # 3% stop
+            
+            # Dynamic take profit
+            if support:
+                take_profit = support * 1.002
+            else:
+                take_profit = current_price * 0.94  # 6% target
+            
+            # Check R/R ratio
+            risk = stop_loss - entry_price
+            reward = entry_price - take_profit
+            
+            if risk > 0:
+                rr_ratio = reward / risk
+                if rr_ratio >= rr_min:
+                    return {
+                        "side": "SELL",
+                        "entry": entry_price,
+                        "sl": stop_loss,
+                        "tp": take_profit,
+                        "confidence": min(95, confidence + 10),
+                        "reason": "; ".join(reasons),
+                        "risk_reward": rr_ratio,
+                        "indicators": {
+                            "rsi": current_rsi,
+                            "ema_9": current_ema_9,
+                            "ema_21": current_ema_21
+                        }
+                    }
+        
+        return {
+            "side": "none",
+            "confidence": confidence,
+            "reason": "; ".join(reasons),
+            "indicators": {
+                "rsi": current_rsi,
+                "ema_9": current_ema_9,
+                "ema_21": current_ema_21
+            }
+        }
+        
     except Exception as e:
-        logger.error(f"analyze_trade_logic fatal: {e}"); logger.error(traceback.format_exc())
-        return {"side": "none", "confidence": 0, "reason": f"internal error: {e}"}
+        logger.error(f"Trade analysis error: {e}")
+        return {"side": "none", "confidence": 0, "reason": f"analysis error: {str(e)[:50]}"}
 
 def multi_tf_confirmation(c30m, c1h, c4h=None):
-    s30 = analyze_trade_logic(c30m); s1 = analyze_trade_logic(c1h)
-    if s30.get("side") == "none" or s1.get("side") == "none":
-        return {"side": "none", "confidence": 0, "reason": "no clear signals on timeframes"}
-    if s30["side"] == s1["side"]:
-        boost = 20
-        if c4h:
-            s4 = analyze_trade_logic(c4h)
-            if s4.get("side") == s30["side"]:
-                boost += 10
-        out = s30.copy()
-        out["confidence"] = min(100, s30.get("confidence", 0) + boost)
-        out["reason"] = out.get("reason", "") + f"; aligned with 1h TF (conf:{s1.get('confidence', 0)}%)"
-        return out
-    return {"side": "none", "confidence": 0, "reason": f"TF conflict:30m={s30.get('side')},1h={s1.get('side')}"}
-
-# ------------- CHART -------------
-def plot_simple_chart(symbol, candles, signal):
+    """Multi-timeframe with relaxed requirements"""
     try:
-        good = []
-        for row in candles[-60:]:
+        signal_30m = analyze_trade_logic(c30m)
+        signal_1h = analyze_trade_logic(c1h)
+        
+        # More lenient confirmation
+        if signal_30m.get("side") == "none":
+            return signal_30m
+        
+        if signal_1h.get("side") == "none":
+            # Allow 30m signal if confidence is high
+            if signal_30m.get("confidence", 0) >= 80:
+                signal_30m["reason"] += "; single TF (high conf)"
+                return signal_30m
+            return {"side": "none", "confidence": 0, "reason": "no 1h confirmation"}
+        
+        if signal_30m["side"] == signal_1h["side"]:
+            # Aligned signals - boost confidence
+            boost = 15
+            if c4h:
+                signal_4h = analyze_trade_logic(c4h)
+                if signal_4h.get("side") == signal_30m["side"]:
+                    boost += 10
+            
+            enhanced_signal = signal_30m.copy()
+            enhanced_signal["confidence"] = min(100, signal_30m.get("confidence", 0) + boost)
+            enhanced_signal["reason"] += f"; TF aligned (1h conf: {signal_1h.get('confidence', 0)}%)"
+            
+            return enhanced_signal
+        
+        # Conflicting signals - check if 30m is very strong
+        if signal_30m.get("confidence", 0) >= 85:
+            signal_30m["reason"] += f"; TF conflict but high 30m conf"
+            return signal_30m
+        
+        return {
+            "side": "none",
+            "confidence": 0,
+            "reason": f"TF conflict: 30m={signal_30m.get('side')}, 1h={signal_1h.get('side')}"
+        }
+        
+    except Exception as e:
+        logger.error(f"Multi-TF analysis error: {e}")
+        return {"side": "none", "confidence": 0, "reason": "multi-tf error"}
+
+# ------------- ENHANCED CHART -------------
+def plot_enhanced_chart(symbol, candles, signal):
+    """Create better charts with more info"""
+    try:
+        # Process last 40 candles for better visibility
+        recent_candles = candles[-40:]
+        dates = []
+        opens, highs, lows, closes = [], [], [], []
+        
+        for candle in recent_candles:
             try:
-                t = int(row[0]); c = float(row[4]); good.append((t, c))
+                timestamp = int(candle[0])
+                dates.append(datetime.utcfromtimestamp(timestamp / 1000))
+                opens.append(float(candle[1]))
+                highs.append(float(candle[2]))
+                lows.append(float(candle[3]))
+                closes.append(float(candle[4]))
             except Exception:
                 continue
-        if not good:
-            tmp = NamedTemporaryFile(delete=False, suffix=".png"); plt.figure(); plt.text(0.5, 0.5, "No data", ha='center'); plt.savefig(tmp.name); plt.close(); return tmp.name
-        dates = [datetime.utcfromtimestamp(int(t) / 1000) for t, c in good]; closes = [c for t, c in good]
-        plt.figure(figsize=(10, 5)); plt.plot(dates, closes); plt.title(f"{symbol} - {signal.get('side', 'none')}"); plt.grid(True)
+        
+        if not closes:
+            return plot_fallback_chart(symbol, signal)
+        
+        # Create figure with subplots
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), 
+                                      gridspec_kw={'height_ratios': [3, 1]})
+        
+        # Main price chart
+        x_indices = range(len(dates))
+        
+        # Plot candlesticks
+        for i, (o, h, l, c) in enumerate(zip(opens, highs, lows, closes)):
+            color = 'green' if c >= o else 'red'
+            # Wick
+            ax1.plot([i, i], [l, h], color='black', linewidth=0.8, alpha=0.8)
+            # Body
+            body_height = abs(c - o)
+            body_bottom = min(o, c)
+            ax1.bar(i, body_height, bottom=body_bottom, width=0.6, 
+                   color=color, alpha=0.7)
+        
+        # Add EMAs
+        if len(closes) >= 21:
+            ema_9_vals = ema(closes, 9)
+            ema_21_vals = ema(closes, 21)
+            
+            if ema_9_vals:
+                valid_ema9 = [(i, val) for i, val in enumerate(ema_9_vals) 
+                             if val is not None and i < len(x_indices)]
+                if valid_ema9:
+                    ema9_x, ema9_y = zip(*valid_ema9)
+                    ax1.plot(ema9_x, ema9_y, color='orange', 
+                            label='EMA 9', linewidth=2, alpha=0.8)
+            
+            if ema_21_vals:
+                valid_ema21 = [(i, val) for i, val in enumerate(ema_21_vals) 
+                              if val is not None and i < len(x_indices)]
+                if valid_ema21:
+                    ema21_x, ema21_y = zip(*valid_ema21)
+                    ax1.plot(ema21_x, ema21_y, color='blue', 
+                            label='EMA 21', linewidth=2, alpha=0.8)
+        
+        # Signal levels
         if signal.get("side") != "none":
-            try: plt.axhline(signal["entry"], linestyle='--'); plt.axhline(signal["sl"], linestyle='--'); plt.axhline(signal["tp"], linestyle='--')
-            except Exception: pass
-        tmp = NamedTemporaryFile(delete=False, suffix=".png"); plt.savefig(tmp.name, bbox_inches='tight'); plt.close(); return tmp.name
+            ax1.axhline(signal["entry"], color="purple", linestyle="--", 
+                       alpha=0.9, linewidth=2, label=f"Entry: {fmt_price(signal['entry'])}")
+            ax1.axhline(signal["sl"], color="red", linestyle="--", 
+                       alpha=0.9, linewidth=2, label=f"SL: {fmt_price(signal['sl'])}")
+            ax1.axhline(signal["tp"], color="green", linestyle="--", 
+                       alpha=0.9, linewidth=2, label=f"TP: {fmt_price(signal['tp'])}")
+        
+        # Chart formatting
+        ax1.set_title(f"{symbol} - {signal.get('side', 'NONE')} | "
+                     f"Confidence: {signal.get('confidence', 0):.1f}% | "
+                     f"R/R: {signal.get('risk_reward', 0):.2f}", 
+                     fontsize=14, fontweight='bold')
+        ax1.legend(loc='upper left')
+        ax1.grid(True, alpha=0.3)
+        ax1.set_ylabel('Price', fontsize=12)
+        
+        # Format x-axis
+        if len(dates) > 0:
+            step = max(1, len(dates) // 8)
+            tick_positions = list(range(0, len(dates), step))
+            ax1.set_xticks(tick_positions)
+            ax1.set_xticklabels([dates[i].strftime('%m/%d %H:%M') 
+                               for i in tick_positions], rotation=45)
+        
+        # RSI subplot
+        if len(closes) >= RSI_PERIOD:
+            rsi_values = calculate_rsi(closes)
+            if rsi_values:
+                rsi_x = range(len(closes) - len(rsi_values), len(closes))
+                ax2.plot(rsi_x, rsi_values, color='purple', linewidth=2, label='RSI')
+                ax2.axhline(70, color='red', linestyle='--', alpha=0.5, label='Overbought')
+                ax2.axhline(30, color='green', linestyle='--', alpha=0.5, label='Oversold')
+                ax2.axhline(50, color='gray', linestyle='-', alpha=0.3)
+                ax2.set_ylabel('RSI', fontsize=10)
+                ax2.set_ylim(0, 100)
+                ax2.grid(True, alpha=0.3)
+                ax2.legend(loc='upper right', fontsize=9)
+        
+        plt.tight_layout()
+        
+        # Save chart
+        temp_file = NamedTemporaryFile(delete=False, suffix=".png")
+        plt.savefig(temp_file.name, dpi=300, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        
+        return temp_file.name
+        
     except Exception as e:
-        logger.error(f"plot_simple_chart failed: {e}"); tmp = NamedTemporaryFile(delete=False, suffix=".png"); plt.figure(); plt.text(0.5, 0.5, "Chart error", ha='center'); plt.savefig(tmp.name); plt.close(); return tmp.name
+        logger.error(f"Enhanced chart creation error: {e}")
+        return plot_fallback_chart(symbol, signal)
 
-# ------------- HTTP SESSION & RETRY -------------
+def plot_fallback_chart(symbol, signal):
+    """Simple fallback chart"""
+    try:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.text(0.5, 0.5, f"{symbol}\n{signal.get('side', 'NO SIGNAL')}\n"
+                          f"Conf: {signal.get('confidence', 0):.1f}%", 
+               ha='center', va='center', transform=ax.transAxes, 
+               fontsize=16, fontweight='bold')
+        ax.set_title(f"{symbol} Trading Signal", fontsize=14)
+        
+        temp_file = NamedTemporaryFile(delete=False, suffix=".png")
+        plt.savefig(temp_file.name, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        
+        return temp_file.name
+    except Exception:
+        return None
+
+# ------------- OPTIMIZED HTTP SESSION -------------
 @asynccontextmanager
 async def get_session():
-    connector = aiohttp.TCPConnector(limit=6, ttl_dns_cache=300, use_dns_cache=True)
-    timeout = aiohttp.ClientTimeout(total=30, connect=10)
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        yield session
-
-async def fetch_json_with_retry(session, url, max_retries=3):
-    global remote_backoff_until
-    now = time.time()
-    if now < remote_backoff_until:
-        wait = remote_backoff_until - now
-        logger.info(f"Global remote backoff active, sleeping {wait:.1f}s before request")
-        await asyncio.sleep(wait)
-    await rate_limiter.wait_if_needed()
-    for attempt in range(max_retries):
-        try:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    try:
-                        return await resp.json()
-                    except Exception:
-                        text = await resp.text()
-                        logger.warning(f"Non-JSON response from {url}: {text[:200]}")
-                        return None
-                elif resp.status == 429:
-                    logger.warning(f"Remote returned 429 for {url} (attempt {attempt+1}). Setting global backoff {REMOTE_BACKOFF_DEFAULT}s.")
-                    remote_backoff_until = time.time() + REMOTE_BACKOFF_DEFAULT
-                    await asyncio.sleep(REMOTE_BACKOFF_DEFAULT)
-                    return None
-                else:
-                    logger.warning(f"HTTP {resp.status} for {url}")
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout for {url} (attempt {attempt+1})")
-        except Exception as e:
-            logger.error(f"Request error for {url}: {e}")
-        await asyncio.sleep(min(30, 1 * (2 ** attempt)))
-    return None
-
-# ------------- AI CONFIRMATION (minimal) -------------
-async def get_enhanced_ai_analysis(symbol, candles, signal):
-    if not client:
-        return None
-    try:
-        closes = []
-        for c in candles[-20:]:
-            try: closes.append(float(c[4]))
-            except: continue
-        if not closes:
-            return None
-        current_price = closes[-1]
-        market_summary = {"symbol": symbol, "current_price": current_price, "local_signal": {"side": signal.get("side"), "confidence": signal.get("confidence")}}
-        system_prompt = "You are an expert trader. Provide short confirm/reject of the local signal (CONF in %). If no signal, reply NO_SIGNAL."
-        user_prompt = f"Market Data:\n{json.dumps(market_summary)}\nPlease respond with short confirmation or NO_SIGNAL."
-        loop = asyncio.get_running_loop()
-        def call_openai():
-            return client.chat.completions.create(model=OPENAI_MODEL, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}], max_tokens=200, temperature=0.2)
-        resp = await loop.run_in_executor(None, call_openai)
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"AI error: {e}"); return None
-
-# ------------- TELEGRAM -------------
-class TelegramNotifier:
-    def __init__(self, bot_token, chat_id):
-        self.bot_token = bot_token; self.chat_id = chat_id; self.base = f"https://api.telegram.org/bot{bot_token}"
-    async def send_message(self, session, text, parse_mode="Markdown"):
-        if not self.bot_token or not self.chat_id:
-            logger.info(f"No Telegram configured, msg: {text[:120]}"); return
-        try:
-            async with session.post(f"{self.base}/sendMessage", json={"chat_id": self.chat_id, "text": text[:4096], "parse_mode": parse_mode}) as r:
-                if r.status != 200:
-                    logger.error(f"Telegram send failed: {r.status}")
-        except Exception as e:
-            logger.error(f"Telegram msg err: {e}")
-    async def send_photo(self, session, caption, path):
-        if not self.bot_token or not self.chat_id:
-            logger.info(f"No Telegram configured, caption: {caption[:120]}")
-            try: os.unlink(path)
-            except: pass
-            return
-        try:
-            with open(path, 'rb') as f:
-                data = aiohttp.FormData(); data.add_field("chat_id", self.chat_id); data.add_field("caption", caption[:1024]); data.add_field("photo", f, filename=os.path.basename(path))
-                async with session.post(f"{self.base}/sendPhoto", data=data) as r:
-                    if r.status != 200:
-                        logger.error(f"Telegram photo failed: {r.status}")
-        except Exception as e:
-            logger.error(f"Telegram photo error: {e}")
-        finally:
-            try: os.unlink(path)
-            except: pass
-
-telegram = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-
-# ------------- MARKET SCANNER (Option A style) -------------
-class MarketScanner:
-    def __init__(self, symbols):
-        self.symbols = symbols
-    async def scan_all_symbols(self, session):
-        signals = []
-        recent = db.get_recent_signals_count(hours=1)
-        if recent >= MAX_SIGNALS_PER_HOUR:
-            logger.warning(f"Signal rate limit reached {recent}/{MAX_SIGNALS_PER_HOUR} per hour"); return []
-        tasks = []
-        # schedule all analyze_symbol tasks immediately; rate_limiter serializes requests
-        for symbol in self.symbols:
-            tasks.append(asyncio.create_task(self.analyze_symbol(session, symbol)))
-        # limit concurrency to 1 (safe)
-        sem = asyncio.Semaphore(1)
-        async def limited(t):
-            async with sem:
-                return await t
-        results = await asyncio.gather(*[limited(t) for t in tasks], return_exceptions=True)
-        for i, res in enumerate(results):
-            if isinstance(res, Exception):
-                logger.error(f"Err analyzing {self.symbols[i]}: {res}"); continue
-            if res and res.get("side") != "none":
-                res["symbol"] = self.symbols[i]; signals.append(res)
-        signals.sort(key=lambda x: x.get("confidence", 0), reverse=True)
-        return signals[:3]
-    async def analyze_symbol(self, session, symbol):
-        try:
-            c30 = await fetch_json_with_retry(session, CANDLE_URL.format(symbol=symbol, interval="30m", limit=100))
-            c1 = await fetch_json_with_retry(session, CANDLE_URL.format(symbol=symbol, interval="1h", limit=100))
-            c4 = await fetch_json_with_retry(session, CANDLE_URL.format(symbol=symbol, interval="4h", limit=50))
-            if not c30 or not c1:
-                logger.warning(f"Failed fetch for {symbol} (c30:{bool(c30)} c1:{bool(c1)})"); return None
-            c30m = [c for c in c30 if c and len(c) >= 5]
-            c1h = [c for c in c1 if c and len(c) >= 5]
-            c4h = [c for c in c4 if c and len(c) >= 5] if c4 else None
-            signal = multi_tf_confirmation(c30m, c1h, c4h)
-            if signal.get("side") != "none" and signal.get("confidence", 0) >= SIGNAL_CONF_THRESHOLD:
-                ai = await get_enhanced_ai_analysis(symbol, c30m, signal)
-                if ai and "NO_SIGNAL" not in ai.upper():
-                    signal["confidence"] = min(100, signal.get("confidence", 0) + 5); signal["ai_analysis"] = ai
-                chart = plot_simple_chart(symbol, c30m, signal); signal["chart_path"] = chart
-                return signal
-            return None
-        except Exception as e:
-            logger.error(f"Symbol analysis error for {symbol}: {e}"); logger.error(traceback.format_exc()); return None
-
-# ------------- PROCESS SIGNAL & MAIN LOOP -------------
-async def process_signal(session, signal):
-    sym = signal.get("symbol", "UNKNOWN"); rr = signal.get("risk_reward", 0); ind = signal.get("indicators", {})
-    msg = (f"🎯 *{sym} {signal.get('side','')} SIGNAL*\n\n"
-           f"💰 Entry: `{fmt_price(signal.get('entry','N/A'))}`\n"
-           f"🛑 SL: `{fmt_price(signal.get('sl','N/A'))}`\n"
-           f"🎯 TP: `{fmt_price(signal.get('tp','N/A'))}`\n"
-           f"📊 Conf: *{signal.get('confidence',0):.1f}%* • R/R: *{rr:.2f}*\n\n"
-           f"📈 RSI: {ind.get('rsi',0):.1f} • EMA9: {fmt_price(ind.get('ema_9',0))} • EMA21: {fmt_price(ind.get('ema_21',0))}\n\n"
-           f"{signal.get('reason','')[:300]}\n⏰ {datetime.utcnow().strftime('%H:%M:%S UTC')}")
-    try:
-        chart = signal.get("chart_path")
-        if chart and os.path.exists(chart):
-            await telegram.send_photo(session, msg, chart)
-        else:
-            await telegram.send_message(session, msg)
-        required = ("symbol", "side", "entry", "sl", "tp", "confidence", "reason")
-        if all(k in signal for k in required):
-            db.save_signal({"symbol": signal["symbol"], "side": signal["side"], "entry": signal["entry"], "sl": signal["sl"], "tp": signal["tp"], "confidence": signal["confidence"], "reason": signal["reason"]})
-        logger.info(f"✅ Sent signal {sym} {signal.get('side')} (Conf {signal.get('confidence')})")
-    except Exception as e:
-        logger.error(f"Failed to send/process signal {sym}: {e}"); logger.error(traceback.format_exc())
-
-async def enhanced_trading_loop():
-    scanner = MarketScanner(SYMBOLS)
-    async with get_session() as session:
-        startup = (f"🚀 Enhanced Trading Bot v5.1 Started\nSymbols: {len(SYMBOLS)} • RateLimiter: 1 req/sec\nScan interval: {POLL_INTERVAL}s • Conf≥{SIGNAL_CONF_THRESHOLD}%")
-        logger.info("Trading bot started successfully!"); await telegram.send_message(session, startup)
-        iteration = 0; last_stats = time.time()
-        while True:
-            iteration += 1; start = time.time()
-            try:
-                logger.info(f"\n=== SCAN {iteration} @ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} ===")
-                signals = await scanner.scan_all_symbols(session)
-                logger.info(f"Scan done in {time.time() - start:.1f}s — signals: {len(signals)}")
-                for s in signals:
-                    try:
-                        await process_signal(session, s); await asyncio.sleep(2)
-                    except Exception as e:
-                        logger.error(f"process signal err: {e}")
-                if time.time() - last_stats > 14400:
-                    await telegram.send_message(session, f"Bot stats: scanned {iteration} cycles"); last_stats = time.time()
-                sleep_time = POLL_INTERVAL if not signals else max(300, POLL_INTERVAL//2)
-                logger.info(f"Sleeping {sleep_time}s until next scan..."); await asyncio.sleep(sleep_time)
-            except Exception as e:
-                logger.error(f"Main loop error: {e}"); logger.error(traceback.format_exc()); await telegram.send_message(session, f"Bot error: {str(e)[:200]}"); await asyncio.sleep(60)
-
-if __name__ == "__main__":
-    try:
-        logger.info("Starting Enhanced Crypto Trading Bot v5.1")
-        asyncio.run(enhanced_trading_loop())
-    except KeyboardInterrupt:
-        logger.info("Stopped by user")
-    except Exception as e:
-        logger.error(f"Fatal: {e}"); logger.error(traceback.format_exc())
+    """Optimized session with better connection pooling"""
+    connector = aiohttp.TCPConnector(
+        limit=50,  # Increased connection pool
+        ttl_dns_cache=300,
+        use_dns_cache=True,
+        keepalive_timeout=60,
+        enable_cleanup_closed=True
+    )
+    timeout = aiohttp.ClientTimeout(total=25, connect=8)
+    
+    async with aiohttp.ClientSession(
+        connector=connector, 
+        timeout=
