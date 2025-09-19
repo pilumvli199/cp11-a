@@ -1,875 +1,870 @@
-#!/usr/bin/env python3
-# main.py - Enhanced Crypto Trading Bot v4.1 (Improved & More Reliable)
-import os, asyncio, aiohttp, traceback, json, logging, time
+# main.py - Enhanced Crypto Trading Bot v6.0 (fixed)
+import os
+import asyncio
+import aiohttp
+import time
+import traceback
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from openai import OpenAI
 import matplotlib
+# Use Agg backend for headless servers (Railway, Docker, etc.)
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.dates import DateFormatter
+from matplotlib.dates import date2num
 from tempfile import NamedTemporaryFile
-from typing import Dict, List, Optional
-import sqlite3
+import numpy as np
+import math
+import shutil
+import json
+from typing import Dict, List, Optional, Tuple
 
 load_dotenv()
 
-# ---------------- LOGGING ----------------
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler('trading_bot.log'), logging.StreamHandler()]
-)
-logger = logging.getLogger(__name__)
-
-# ---------------- CONFIG ----------------
+# --- Enhanced Config ---
 SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "AAVEUSDT",
-    "TRXUSDT", "DOGEUSDT", "BNBUSDT", "ADAUSDT", "LTCUSDT", "LINKUSDT"
+    "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","AAVEUSDT",
+    "TRXUSDT","DOGEUSDT","BNBUSDT","ADAUSDT","LTCUSDT","LINKUSDT"
 ]
-POLL_INTERVAL = max(60, int(os.getenv("POLL_INTERVAL", 1800)))  # Minimum 1 minute
+POLL_INTERVAL = max(30, int(os.getenv("POLL_INTERVAL", 1800)))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 65.0))  # Lowered threshold
-MAX_SIGNALS_PER_HOUR = int(os.getenv("MAX_SIGNALS_PER_HOUR", 5))
-RSI_PERIOD = int(os.getenv("RSI_PERIOD", 14))
+SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 75.0))  # default 75%
+
+# New enhanced parameters
+RSI_PERIOD = 14
+MA_SHORT = 7
+MA_LONG = 21
+VOLUME_MULTIPLIER = 1.5  # For volume spike detection
+MIN_CANDLES_FOR_ANALYSIS = 50  # Minimum candles needed
+LOOKBACK_PERIOD = 48  # Extended lookback for better patterns
+
+# Historical data tracking (in-memory for session)
+price_history = {}
+signal_history = []
+success_rate_tracker = {}
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-BASE_URL = "https://api.binance.com/api/v3"
-CANDLE_URL = f"{BASE_URL}/klines?symbol={{symbol}}&interval={{interval}}&limit={{limit}}"
+TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
+CANDLE_URL = "https://api.binance.com/api/v3/klines?symbol={symbol}&interval=30m&limit=100"
+ORDER_BOOK_URL = "https://api.binance.com/api/v3/depth?symbol={symbol}&limit=10"
 
-# ---------------- DATABASE ----------------
-class SignalDatabase:
-    def __init__(self, db_path="signals.db"):
-        self.db_path = db_path
-        self.init_db()
-    
-    def init_db(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("""CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL, side TEXT NOT NULL,
-            entry_price REAL NOT NULL, sl_price REAL NOT NULL, tp_price REAL NOT NULL,
-            confidence REAL NOT NULL, reason TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )""")
-        conn.commit()
-        conn.close()
-    
-    def save_signal(self, signal_data: Dict):
-        try:
-            conn = sqlite3.connect(self.db_path)
-            conn.execute("""INSERT INTO signals (symbol, side, entry_price, sl_price, tp_price, confidence, reason)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)""", (
-                signal_data['symbol'], signal_data['side'], float(signal_data['entry']),
-                float(signal_data['sl']), float(signal_data['tp']), 
-                float(signal_data['confidence']), signal_data['reason']
-            ))
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            logger.error(f"DB save failed: {e}")
-    
-    def get_recent_signals_count(self, hours=1) -> int:
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cutoff = datetime.now() - timedelta(hours=hours)
-            cur = conn.execute("SELECT COUNT(*) FROM signals WHERE timestamp > ?", (cutoff,))
-            count = cur.fetchone()[0]
-            conn.close()
-            return count
-        except Exception as e:
-            logger.error(f"DB count failed: {e}")
-            return 0
+# ---------------- Enhanced Technical Indicators ----------------
+def calculate_rsi(prices: List[float], period: int = 14) -> Optional[float]:
+    """Calculate RSI indicator"""
+    if len(prices) < period + 1:
+        return None
 
-db = SignalDatabase()
+    gains = []
+    losses = []
 
-# ---------------- RATE LIMITER ----------------
-class RateLimiter:
-    def __init__(self, max_requests=10, window_seconds=60):
-        self.max_requests = max_requests
-        self.window_seconds = window_seconds
-        self.requests = []
-        self._lock = asyncio.Lock()
-    
-    async def wait_if_needed(self):
-        async with self._lock:
-            now = time.time()
-            # Remove old requests
-            self.requests = [t for t in self.requests if now - t < self.window_seconds]
-            
-            if len(self.requests) < self.max_requests:
-                self.requests.append(now)
-                return
-            
-            # Need to wait
-            oldest = self.requests[0]
-            sleep_time = self.window_seconds - (now - oldest)
-            if sleep_time > 0:
-                logger.info(f"Rate limit hit, sleeping {sleep_time:.1f}s")
-        
-        if sleep_time > 0:
-            await asyncio.sleep(sleep_time)
-            async with self._lock:
-                self.requests.append(time.time())
-
-rate_limiter = RateLimiter(max_requests=10, window_seconds=60)
-
-# ---------------- UTILITIES ----------------
-def fmt_price(p):
-    try:
-        p = float(p)
-        if abs(p) < 0.001: return f"{p:.8f}"
-        elif abs(p) < 1: return f"{p:.6f}"
-        elif abs(p) < 100: return f"{p:.4f}"
-        else: return f"{p:.2f}"
-    except:
-        return str(p)
-
-def calculate_rsi(closes, period=RSI_PERIOD):
-    if len(closes) < period + 1:
-        return []
-    
-    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    gains = [d if d > 0 else 0 for d in deltas]
-    losses = [-d if d < 0 else 0 for d in deltas]
-    
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    
-    rsi_vals = []
-    for i in range(period, len(closes)):
-        if avg_loss == 0:
-            rsi = 100.0
+    for i in range(1, len(prices)):
+        change = prices[i] - prices[i-1]
+        if change > 0:
+            gains.append(change)
+            losses.append(0)
         else:
-            rs = avg_gain / avg_loss
-            rsi = 100 - (100 / (1 + rs))
-        rsi_vals.append(rsi)
-        
-        if i < len(deltas):
-            gain = gains[i] if i < len(gains) else 0
-            loss = losses[i] if i < len(losses) else 0
-            avg_gain = (avg_gain * (period - 1) + gain) / period
-            avg_loss = (avg_loss * (period - 1) + loss) / period
-    
-    return rsi_vals
+            gains.append(0)
+            losses.append(abs(change))
 
-def ema(values, period):
-    if len(values) < period:
-        return []
-    
-    k = 2 / (period + 1)
-    ema_vals = [None] * (period - 1)
-    sma = sum(values[:period]) / period
-    ema_vals.append(sma)
-    
-    for i in range(period, len(values)):
-        ema_vals.append(values[i] * k + ema_vals[-1] * (1 - k))
-    
-    return ema_vals
+    if len(gains) < period:
+        return None
 
-def find_support_resistance(closes, highs, lows, lookback=50):
-    """Find support and resistance levels using pivot points"""
-    if len(closes) < lookback:
-        lookback = len(closes)
-    
-    recent_closes = closes[-lookback:]
-    recent_highs = highs[-lookback:]
-    recent_lows = lows[-lookback:]
-    
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return round(rsi, 2)
+
+def calculate_moving_averages(prices: List[float]) -> Tuple[Optional[float], Optional[float]]:
+    """Calculate short and long moving averages"""
+    if len(prices) < MA_LONG:
+        return None, None
+
+    ma_short = sum(prices[-MA_SHORT:]) / MA_SHORT if len(prices) >= MA_SHORT else None
+    ma_long = sum(prices[-MA_LONG:]) / MA_LONG
+
+    return ma_short, ma_long
+
+def detect_volume_spike(volumes: List[float]) -> bool:
+    """Detect if current volume is significantly higher than average"""
+    if len(volumes) < 10:
+        return False
+
+    avg_volume = sum(volumes[-10:-1]) / 9  # Exclude current volume
+    current_volume = volumes[-1]
+
+    return current_volume > (avg_volume * VOLUME_MULTIPLIER)
+
+def enhanced_levels(candles, lookback=LOOKBACK_PERIOD):
+    """Enhanced support/resistance calculation with multiple timeframes"""
+    if not candles or len(candles) < 10:
+        return (None, None, None, None, None)
+
+    arr = candles[-lookback:] if len(candles) >= lookback else candles
+    highs = [c[1] for c in arr]  # High prices
+    lows = [c[2] for c in arr]   # Low prices
+    closes = [c[3] for c in arr] # Close prices
+
+    highs_sorted = sorted(highs, reverse=True)
+    lows_sorted = sorted(lows)
+
+    primary_resistance = sum(highs_sorted[:3]) / 3 if len(highs_sorted) >= 3 else None
+    primary_support = sum(lows_sorted[:3]) / 3 if len(lows_sorted) >= 3 else None
+
+    secondary_resistance = sum(highs_sorted[3:6]) / 3 if len(highs_sorted) >= 6 else None
+    secondary_support = sum(lows_sorted[3:6]) / 3 if len(lows_sorted) >= 6 else None
+
     current_price = closes[-1]
-    
-    # Find potential support (recent lows below current price)
-    supports = [low for low in recent_lows if low < current_price * 0.98]
-    support = max(supports) if supports else current_price * 0.95
-    
-    # Find potential resistance (recent highs above current price)
-    resistances = [high for high in recent_highs if high > current_price * 1.02]
-    resistance = min(resistances) if resistances else current_price * 1.05
-    
-    return support, resistance
+    if primary_resistance and primary_support:
+        mid_level = (primary_resistance + primary_support) / 2
+    else:
+        mid_level = current_price
 
-def analyze_trade_logic(candles, rr_min=1.2):
-    """Enhanced trade analysis with multiple indicators"""
+    return primary_support, primary_resistance, secondary_support, secondary_resistance, mid_level
+
+def detect_patterns(candles) -> Dict[str, bool]:
+    """Detect common candlestick patterns"""
+    if len(candles) < 5:
+        return {}
+
+    patterns = {}
+    last_5 = candles[-5:]
+
+    # Doji pattern (open ≈ close)
+    last_candle = last_5[-1]
+    body_size = abs(last_candle[3] - last_candle[0])  # |close - open|
+    range_size = last_candle[1] - last_candle[2]      # high - low
+
+    patterns['doji'] = (body_size / range_size) < 0.1 if range_size > 0 else False
+
+    # Hammer pattern (long lower wick, small body at top)
+    # compute lower & upper wicks defensively
     try:
-        if not candles or len(candles) < 30:
-            return {"side": "none", "confidence": 0, "reason": "insufficient data"}
-        
-        # Extract OHLC data
-        opens = [float(c[1]) for c in candles]
-        highs = [float(c[2]) for c in candles]
-        lows = [float(c[3]) for c in candles]
-        closes = [float(c[4]) for c in candles]
-        
-        current_price = closes[-1]
-        
-        # Calculate indicators
-        ema9 = ema(closes, 9)
-        ema21 = ema(closes, 21)
-        ema50 = ema(closes, 50)
-        rsi_vals = calculate_rsi(closes)
-        
-        if not ema9 or not ema21 or not rsi_vals:
-            return {"side": "none", "confidence": 0, "reason": "indicator calculation failed"}
-        
-        cur_ema9 = ema9[-1]
-        cur_ema21 = ema21[-1]
-        cur_ema50 = ema50[-1] if ema50 else cur_ema21
-        cur_rsi = rsi_vals[-1]
-        
-        # Find support and resistance
-        support, resistance = find_support_resistance(closes, highs, lows)
-        
-        confidence = 40
-        reasons = []
-        
-        # Trend analysis
-        if current_price > cur_ema9 > cur_ema21:
-            confidence += 20
-            reasons.append("strong bullish trend")
-        elif current_price < cur_ema9 < cur_ema21:
-            confidence += 20
-            reasons.append("strong bearish trend")
-        elif current_price > cur_ema9:
-            confidence += 10
-            reasons.append("short-term bullish")
-        elif current_price < cur_ema9:
-            confidence += 10
-            reasons.append("short-term bearish")
-        
-        # RSI analysis
-        if cur_rsi < 35:
-            confidence += 15
-            reasons.append(f"oversold RSI({cur_rsi:.1f})")
-        elif cur_rsi > 65:
-            confidence += 15
-            reasons.append(f"overbought RSI({cur_rsi:.1f})")
-        elif 35 <= cur_rsi <= 45:
-            confidence += 8
-            reasons.append("RSI in buy zone")
-        elif 55 <= cur_rsi <= 65:
-            confidence += 8
-            reasons.append("RSI in sell zone")
-        
-        # Volume analysis (basic)
-        volumes = [float(c[5]) for c in candles[-5:]]
-        avg_volume = sum(volumes) / len(volumes)
-        current_volume = volumes[-1]
-        
-        if current_volume > avg_volume * 1.2:
-            confidence += 5
-            reasons.append("high volume")
-        
-        # Generate signals
-        entry = current_price
-        
-        # BUY signal conditions
-        if (current_price > cur_ema9 and cur_rsi < 50 and 
-            confidence >= 50):
-            
-            sl = support
-            tp = resistance
-            
-            if entry > sl:
-                rr = (tp - entry) / (entry - sl)
-                if rr >= rr_min:
-                    return {
-                        "side": "BUY",
-                        "entry": entry,
-                        "sl": sl,
-                        "tp": tp,
-                        "confidence": min(95, confidence + 10),
-                        "reason": "; ".join(reasons),
-                        "risk_reward": rr,
-                        "indicators": {
-                            "rsi": cur_rsi,
-                            "ema_9": cur_ema9,
-                            "ema_21": cur_ema21
-                        }
-                    }
-        
-        # SELL signal conditions
-        if (current_price < cur_ema9 and cur_rsi > 50 and 
-            confidence >= 50):
-            
-            sl = resistance
-            tp = support
-            
-            if sl > entry:
-                rr = (entry - tp) / (sl - entry)
-                if rr >= rr_min:
-                    return {
-                        "side": "SELL",
-                        "entry": entry,
-                        "sl": sl,
-                        "tp": tp,
-                        "confidence": min(95, confidence + 10),
-                        "reason": "; ".join(reasons),
-                        "risk_reward": rr,
-                        "indicators": {
-                            "rsi": cur_rsi,
-                            "ema_9": cur_ema9,
-                            "ema_21": cur_ema21
-                        }
-                    }
-        
-        return {
-            "side": "none",
-            "confidence": confidence,
-            "reason": "; ".join(reasons) if reasons else "no clear signal",
-            "indicators": {
-                "rsi": cur_rsi,
-                "ema_9": cur_ema9,
-                "ema_21": cur_ema21
-            }
-        }
-    
-    except Exception as e:
-        logger.error(f"analyze_trade_logic error: {e}")
-        return {"side": "none", "confidence": 0, "reason": f"analysis error: {e}"}
+        lower_wick = (last_candle[0] - last_candle[2]) if last_candle[0] > last_candle[2] else (last_candle[3] - last_candle[2])
+        upper_wick = last_candle[1] - max(last_candle[0], last_candle[3])
+    except Exception:
+        lower_wick = 0
+        upper_wick = 0
 
-def multi_tf_confirmation(c30m, c1h):
-    """Multi-timeframe confirmation with more flexible rules"""
-    s30 = analyze_trade_logic(c30m)
-    s1h = analyze_trade_logic(c1h)
-    
-    logger.debug(f"30m: {s30.get('side')} ({s30.get('confidence', 0)}%), 1h: {s1h.get('side')} ({s1h.get('confidence', 0)}%)")
-    
-    # If both timeframes agree
-    if s30.get("side") != "none" and s30["side"] == s1h.get("side"):
-        boost = 20
-        out = s30.copy()
-        out["confidence"] = min(100, s30.get("confidence", 0) + boost)
-        out["reason"] = out.get("reason", "") + f"; confirmed by 1h TF"
-        return out
-    
-    # If 30m has strong signal and 1h is neutral
-    if (s30.get("side") != "none" and s30.get("confidence", 0) >= 70 and 
-        s1h.get("side") == "none"):
-        out = s30.copy()
-        out["confidence"] = min(100, s30.get("confidence", 0) + 5)
-        out["reason"] = out.get("reason", "") + f"; 1h neutral"
-        return out
-    
-    # If 1h has signal and 30m is neutral (but lower confidence)
-    if (s1h.get("side") != "none" and s1h.get("confidence", 0) >= 60 and 
-        s30.get("side") == "none"):
-        out = s1h.copy()
-        out["confidence"] = min(100, s1h.get("confidence", 0) - 10)
-        out["reason"] = out.get("reason", "") + f"; from 1h TF only"
-        return out
-    
-    return {
-        "side": "none",
-        "confidence": max(s30.get("confidence", 0), s1h.get("confidence", 0)),
-        "reason": f"TF conflict or weak signals: 30m={s30.get('side')}, 1h={s1h.get('side')}"
-    }
+    patterns['hammer'] = (lower_wick > 2 * body_size) and (upper_wick < body_size) if body_size > 0 else False
 
-# ---------------- CHART GENERATION ----------------
-def plot_signal_chart(symbol, candles, signal):
-    """Create an enhanced chart with indicators"""
+    # Engulfing pattern
+    if len(last_5) >= 2:
+        prev, curr = last_5[-2], last_5[-1]
+        patterns['bullish_engulfing'] = (curr[3] > curr[0]) and (prev[3] < prev[0]) and \
+                                      (curr[3] > prev[0]) and (curr[0] < prev[3])
+        patterns['bearish_engulfing'] = (curr[3] < curr[0]) and (prev[3] > prev[0]) and \
+                                      (curr[3] < prev[0]) and (curr[0] > prev[3])
+
+    return patterns
+
+# ---------------- Enhanced Data Fetching ----------------
+async def fetch_json(session, url):
     try:
-        if not candles:
-            return None
-        
-        # Extract data
-        timestamps = [datetime.utcfromtimestamp(int(c[0]) / 1000) for c in candles[-60:]]
-        opens = [float(c[1]) for c in candles[-60:]]
-        highs = [float(c[2]) for c in candles[-60:]]
-        lows = [float(c[3]) for c in candles[-60:]]
-        closes = [float(c[4]) for c in candles[-60:]]
-        
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), gridspec_kw={'height_ratios': [3, 1]})
-        
-        # Price chart with candlesticks (simplified)
-        ax1.plot(timestamps, closes, color='blue', linewidth=1, alpha=0.7)
-        
-        # EMAs
-        if len(closes) >= 21:
-            ema9_vals = ema(closes, 9)
-            ema21_vals = ema(closes, 21)
-            
-            if ema9_vals and len(ema9_vals) > 0:
-                ema9_times = timestamps[-len(ema9_vals):]
-                ax1.plot(ema9_times, ema9_vals, color='orange', linewidth=1, label='EMA9', alpha=0.8)
-            
-            if ema21_vals and len(ema21_vals) > 0:
-                ema21_times = timestamps[-len(ema21_vals):]
-                ax1.plot(ema21_times, ema21_vals, color='red', linewidth=1, label='EMA21', alpha=0.8)
-        
-        # Signal levels
-        if signal.get("side") != "none":
-            ax1.axhline(signal["entry"], color="blue", linestyle="--", alpha=0.8, label=f"Entry: {fmt_price(signal['entry'])}")
-            ax1.axhline(signal["sl"], color="red", linestyle="--", alpha=0.8, label=f"SL: {fmt_price(signal['sl'])}")
-            ax1.axhline(signal["tp"], color="green", linestyle="--", alpha=0.8, label=f"TP: {fmt_price(signal['tp'])}")
-        
-        ax1.set_title(f"{symbol} - {signal.get('side', 'NO SIGNAL')} | Confidence: {signal.get('confidence', 0):.1f}%")
-        ax1.legend(loc='upper left', fontsize=8)
-        ax1.grid(True, alpha=0.3)
-        
-        # RSI subplot
-        if len(closes) >= 14:
-            rsi_vals = calculate_rsi(closes)
-            if rsi_vals:
-                rsi_times = timestamps[-len(rsi_vals):]
-                ax2.plot(rsi_times, rsi_vals, color='purple', linewidth=1)
-                ax2.axhline(70, color='red', linestyle='--', alpha=0.5)
-                ax2.axhline(30, color='green', linestyle='--', alpha=0.5)
-                ax2.set_ylim(0, 100)
-                ax2.set_ylabel('RSI')
-                ax2.grid(True, alpha=0.3)
-        
-        # Format dates
-        ax1.xaxis.set_major_formatter(DateFormatter('%H:%M'))
-        ax2.xaxis.set_major_formatter(DateFormatter('%H:%M'))
-        
-        plt.tight_layout()
-        
-        # Save to temporary file
-        tmp_file = NamedTemporaryFile(delete=False, suffix=".png")
-        fig.savefig(tmp_file.name, dpi=100, bbox_inches='tight')
-        plt.close(fig)
-        
-        return tmp_file.name
-        
+        async with session.get(url, timeout=15) as r:
+            if r.status != 200:
+                try:
+                    txt = await r.text()
+                except:
+                    txt = "<no body>"
+                print(f"fetch_json {url} returned {r.status}: {txt[:200]}")
+                return None
+            return await r.json()
     except Exception as e:
-        logger.error(f"Chart generation error: {e}")
+        print("fetch_json exception for", url, e)
         return None
 
-# ---------------- HTTP REQUESTS ----------------
-async def fetch_json_with_retry(session, url, max_retries=3):
-    """Fetch JSON with retry logic and rate limiting"""
-    await rate_limiter.wait_if_needed()
-    
-    for attempt in range(max_retries):
+async def fetch_enhanced_data(session, symbol):
+    """Fetch enhanced market data including order book"""
+    ticker_task = fetch_json(session, TICKER_URL.format(symbol=symbol))
+    candle_task = fetch_json(session, CANDLE_URL.format(symbol=symbol))
+    orderbook_task = fetch_json(session, ORDER_BOOK_URL.format(symbol=symbol))
+
+    ticker, candles, orderbook = await asyncio.gather(ticker_task, candle_task, orderbook_task)
+
+    out = {}
+
+    # Process ticker data
+    if ticker:
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as response:
-                if response.status == 200:
-                    return await response.json()
-                elif response.status == 429:
-                    wait_time = 60
-                    logger.warning(f"Rate limited by API, waiting {wait_time}s")
-                    await asyncio.sleep(wait_time)
-                else:
-                    logger.warning(f"HTTP {response.status} for {url}")
-        
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout for {url} (attempt {attempt + 1})")
+            out["price"] = float(ticker.get("lastPrice", 0))
+            out["volume"] = float(ticker.get("volume", 0))
+            out["price_change_24h"] = float(ticker.get("priceChangePercent", 0))
+            out["high_24h"] = float(ticker.get("highPrice", 0))
+            out["low_24h"] = float(ticker.get("lowPrice", 0))
         except Exception as e:
-            logger.error(f"Request error for {url}: {e}")
-        
-        if attempt < max_retries - 1:
-            await asyncio.sleep(2 ** attempt)
-    
-    return None
+            print(f"Error processing ticker for {symbol}: {e}")
+            out["price"] = None
+            out["volume"] = None
 
-# ---------------- AI ANALYSIS ----------------
-async def get_ai_confirmation(symbol, signal_data):
-    """Get AI confirmation for signals"""
+    # Process candle data
+    if isinstance(candles, list) and len(candles) >= MIN_CANDLES_FOR_ANALYSIS:
+        try:
+            # Binance kline format: [openTime, open, high, low, close, volume, ...]
+            out["candles"] = [[float(x[1]), float(x[2]), float(x[3]), float(x[4])] for x in candles]
+            out["times"] = [int(x[0]) // 1000 for x in candles]
+            out["volumes"] = [float(x[5]) for x in candles]
+
+            closes = [float(x[4]) for x in candles]
+            out["rsi"] = calculate_rsi(closes, RSI_PERIOD)
+            out["ma_short"], out["ma_long"] = calculate_moving_averages(closes)
+            out["volume_spike"] = detect_volume_spike(out["volumes"])
+            out["patterns"] = detect_patterns(out["candles"])
+
+        except Exception as e:
+            print("Enhanced candle processing error for", symbol, e)
+            out["candles"] = None
+
+    # Process order book
+    if orderbook:
+        try:
+            bids = [(float(x[0]), float(x[1])) for x in orderbook.get("bids", [])]
+            asks = [(float(x[0]), float(x[1])) for x in orderbook.get("asks", [])]
+
+            if bids and asks:
+                out["bid"] = bids[0][0]
+                out["ask"] = asks[0][0]
+                out["spread"] = asks[0][0] - bids[0][0]
+
+                total_bid_volume = sum(x[1] for x in bids[:5])
+                total_ask_volume = sum(x[1] for x in asks[:5])
+                out["buy_pressure"] = (total_bid_volume / total_ask_volume) if total_ask_volume > 0 else 0
+        except Exception as e:
+            print(f"Order book processing error for {symbol}: {e}")
+
+    # Store price history for trend analysis
+    if symbol not in price_history:
+        price_history[symbol] = []
+
+    if out.get("price") is not None:
+        price_history[symbol].append({
+            "price": out["price"],
+            "timestamp": datetime.now(),
+            "volume": out.get("volume", 0)
+        })
+
+        # Keep only last 100 entries
+        if len(price_history[symbol]) > 100:
+            price_history[symbol] = price_history[symbol][-100:]
+
+    return out
+
+# ---------------- Enhanced OpenAI Analysis ----------------
+async def enhanced_analyze_openai(market):
+    """Enhanced analysis with more technical indicators and context"""
     if not client:
+        print("No OpenAI client configured.")
         return None
-    
-    try:
-        system_prompt = ("You are a professional crypto trader. Analyze the provided market data and "
-                        "either CONFIRM or REJECT the trading signal. Be concise.")
-        
-        user_prompt = f"""
-Market: {symbol}
-Signal: {signal_data.get('side', 'none')}
-Entry: {signal_data.get('entry', 'N/A')}
-Confidence: {signal_data.get('confidence', 0)}%
-Reason: {signal_data.get('reason', 'N/A')}
 
-Respond with either 'CONFIRM' or 'REJECT' followed by brief reasoning.
-"""
-        
+    # Build comprehensive market analysis data
+    analysis_parts = []
+    for symbol, data in market.items():
+        if not data.get("price"):
+            continue
+
+        price = data["price"]
+        volume = data.get("volume", 0)
+        price_change = data.get("price_change_24h", 0)
+
+        part = f"\n{symbol} Analysis:"
+        part += f"\nPrice: ${price} (24h change: {price_change:+.2f}%)"
+        part += f"\nVolume: {volume:,.0f}"
+
+        if data.get("rsi"):
+            rsi = data["rsi"]
+            rsi_signal = "Oversold" if rsi < 30 else "Overbought" if rsi > 70 else "Neutral"
+            part += f"\nRSI: {rsi} ({rsi_signal})"
+
+        if data.get("ma_short") and data.get("ma_long"):
+            ma_signal = "Bullish" if data["ma_short"] > data["ma_long"] else "Bearish"
+            part += f"\nMA Cross: {ma_signal} (Short: {data['ma_short']:.6f}, Long: {data['ma_long']:.6f})"
+
+        if data.get("volume_spike"):
+            part += f"\nVolume: SPIKE DETECTED"
+
+        if data.get("buy_pressure"):
+            pressure = "Strong Buy" if data["buy_pressure"] > 1.2 else "Strong Sell" if data["buy_pressure"] < 0.8 else "Balanced"
+            part += f"\nOrder Book: {pressure} (Ratio: {data['buy_pressure']:.2f})"
+
+        patterns = data.get("patterns", {})
+        active_patterns = [k for k, v in patterns.items() if v]
+        if active_patterns:
+            part += f"\nPatterns: {', '.join(active_patterns)}"
+
+        if data.get("candles"):
+            sup1, res1, sup2, res2, mid = enhanced_levels(data["candles"])
+            if sup1 and res1:
+                distance_to_support = ((price - sup1) / sup1) * 100
+                distance_to_resistance = ((res1 - price) / price) * 100
+                part += f"\nS/R: Support at {sup1:.6f} ({distance_to_support:+.1f}%), Resistance at {res1:.6f} ({distance_to_resistance:+.1f}%)"
+
+        if data.get("candles") and len(data["candles"]) >= 5:
+            recent = data["candles"][-5:]
+            candle_str = ",".join([f"[O:{c[0]:.6f},H:{c[1]:.6f},L:{c[2]:.6f},C:{c[3]:.6f}]" for c in recent])
+            part += f"\nRecent 5 candles: {candle_str}"
+
+        analysis_parts.append(part)
+
+    if not analysis_parts:
+        print("No market data available for enhanced analysis.")
+        return None
+
+    prompt = f"""You are an expert crypto trading analyst with deep knowledge of technical analysis, market psychology, and risk management.
+
+ANALYSIS CONTEXT:
+- Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+- Market conditions: Analyze for potential reversals, breakouts, and trend continuations
+- Risk level: Only suggest trades with high probability setups
+
+TECHNICAL ANALYSIS FOCUS:
+1. Multi-timeframe confluence (look for alignment of indicators)
+2. Volume confirmation (stronger signals when volume supports price action)
+3. Support/resistance interactions (breakouts, rejections, retests)
+4. Pattern recognition (engulfing, doji, hammer, etc.)
+5. RSI divergences and extreme levels
+6. Moving average trends and crossovers
+7. Order book pressure analysis
+
+SIGNAL CRITERIA (Only output if ALL conditions met):
+- Minimum 70% confidence required
+- Clear technical setup with multiple confirmations
+- Proper risk/reward ratio (minimum 1:2)
+- Volume supporting the move
+- No conflicting signals from other indicators
+
+OUTPUT FORMAT (one line per strong signal only):
+SYMBOL - ACTION - DETAILED_REASON - CONF: XX%
+
+Where:
+- ACTION: BUY/SELL only (no NEUTRAL unless no clear setup)
+- DETAILED_REASON: Must include specific technical levels, patterns, and confirmations
+- CONF: 70-100% (below 70% should not be reported)
+
+MARKET DATA:
+{"".join(analysis_parts)}
+
+Remember: Quality over quantity. Only suggest trades with clear edge and multiple confirmations."""
+
+    try:
         loop = asyncio.get_running_loop()
-        
-        def call_openai():
+
+        def call_model():
             return client.chat.completions.create(
                 model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                max_tokens=150,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1200,
                 temperature=0.1
             )
-        
-        response = await loop.run_in_executor(None, call_openai)
-        return response.choices[0].message.content.strip()
-    
+
+        resp = await loop.run_in_executor(None, call_model)
+
+        try:
+            choice = resp.choices[0]
+            content = choice.message.content if hasattr(choice, "message") else getattr(choice, "text", None)
+            if content is None:
+                content = str(resp)
+            return content.strip()
+        except Exception:
+            return str(resp)
+
     except Exception as e:
-        logger.error(f"AI confirmation error: {e}")
+        print("Enhanced OpenAI call failed:", e)
+        traceback.print_exc()
         return None
 
-# ---------------- TELEGRAM NOTIFICATIONS ----------------
-class TelegramNotifier:
-    def __init__(self, bot_token, chat_id):
-        self.bot_token = bot_token
-        self.chat_id = chat_id
-        self.base_url = f"https://api.telegram.org/bot{bot_token}"
-    
-    async def send_message(self, session, text, parse_mode="Markdown"):
-        if not self.bot_token or not self.chat_id:
-            logger.info(f"[TELEGRAM] {text}")
-            return
-        
+# ---------------- Enhanced Plotting ----------------
+def enhanced_plot_chart(times, candles, symbol, market_data):
+    """Enhanced chart with multiple indicators"""
+    if not times or not candles or len(times) != len(candles) or len(candles) < 10:
+        raise ValueError("Insufficient data for enhanced plotting")
+
+    dates = [datetime.utcfromtimestamp(int(t)) for t in times]
+    closes = [c[3] for c in candles]
+    x = date2num(dates)
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), dpi=100, gridspec_kw={'height_ratios': [3, 1]})
+
+    width = 0.6 * (x[1] - x[0]) if len(x) > 1 else 0.4
+    for xi, candle in zip(x, candles):
+        o, h, l, c = candle
+        color = "green" if c >= o else "red"
+        edge_color = "darkgreen" if c >= o else "darkred"
+
+        ax1.vlines(xi, l, h, color=edge_color, linewidth=0.8)
+        rect_height = abs(c - o) if abs(c - o) > 0.0001 else 0.0001
+        rect = plt.Rectangle((xi - width/2, min(o, c)), width, rect_height,
+                             facecolor=color, edgecolor=edge_color, alpha=0.8)
+        ax1.add_patch(rect)
+
+    # Support/Resistance levels
+    sup1, res1, sup2, res2, mid = enhanced_levels(candles)
+    if res1:
+        ax1.axhline(res1, color="red", linestyle="--", alpha=0.7,
+                   label=f"Primary Resistance: {res1:.6f}" if res1 < 1 else f"Primary Resistance: {res1:.2f}")
+    if sup1:
+        ax1.axhline(sup1, color="blue", linestyle="--", alpha=0.7,
+                   label=f"Primary Support: {sup1:.6f}" if sup1 < 1 else f"Primary Support: {sup1:.2f}")
+    if res2:
+        ax1.axhline(res2, color="orange", linestyle=":", alpha=0.5,
+                   label=f"Secondary Resistance: {res2:.2f}")
+    if sup2:
+        ax1.axhline(sup2, color="cyan", linestyle=":", alpha=0.5,
+                   label=f"Secondary Support: {sup2:.2f}")
+
+    # Moving averages
+    if len(closes) >= MA_LONG:
+        ma_short_values = []
+        ma_long_values = []
+
+        for i in range(len(closes)):
+            if i >= MA_SHORT - 1:
+                ma_short_values.append(sum(closes[i-MA_SHORT+1:i+1]) / MA_SHORT)
+            else:
+                ma_short_values.append(None)
+
+            if i >= MA_LONG - 1:
+                ma_long_values.append(sum(closes[i-MA_LONG+1:i+1]) / MA_LONG)
+            else:
+                ma_long_values.append(None)
+
+        valid_short = [(x[i], ma) for i, ma in enumerate(ma_short_values) if ma is not None]
+        valid_long = [(x[i], ma) for i, ma in enumerate(ma_long_values) if ma is not None]
+
+        if valid_short:
+            x_short, y_short = zip(*valid_short)
+            ax1.plot(x_short, y_short, color="purple", linewidth=1.5, alpha=0.8, label=f"MA{MA_SHORT}")
+
+        if valid_long:
+            x_long, y_long = zip(*valid_long)
+            ax1.plot(x_long, y_long, color="brown", linewidth=1.5, alpha=0.8, label=f"MA{MA_LONG}")
+
+    # RSI subplot
+    if market_data.get("candles") and len(market_data["candles"]) >= RSI_PERIOD + 5:
+        rsi_values = []
+        for i in range(RSI_PERIOD, len(closes)):
+            rsi = calculate_rsi(closes[:i+1], RSI_PERIOD)
+            rsi_values.append(rsi)
+
+        if rsi_values:
+            rsi_x = x[-len(rsi_values):]
+            ax2.plot(rsi_x, rsi_values, color="blue", linewidth=1.5)
+            ax2.axhline(70, color="red", linestyle="--", alpha=0.7, label="Overbought (70)")
+            ax2.axhline(30, color="green", linestyle="--", alpha=0.7, label="Oversold (30)")
+            ax2.axhline(50, color="gray", linestyle=":", alpha=0.5)
+            ax2.set_ylim(0, 100)
+            ax2.set_ylabel("RSI", fontsize=10)
+            ax2.legend(fontsize="small")
+            ax2.grid(True, alpha=0.3)
+
+    # Title with current info
+    current_price = closes[-1]
+    rsi_current = market_data.get("rsi", "N/A")
+    volume_status = "VOLUME_SPIKE" if market_data.get("volume_spike") else ""
+
+    if current_price < 1:
+        price_str = f"{current_price:.6f}"
+    else:
+        price_str = f"{current_price:.2f}"
+
+    title = f"{symbol} - Price: {price_str} | RSI: {rsi_current} {volume_status}"
+    ax1.set_title(title, fontsize=12, fontweight="bold")
+    ax1.legend(loc="upper left", fontsize="small")
+    ax1.grid(True, alpha=0.3)
+
+    fig.autofmt_xdate()
+    plt.tight_layout()
+
+    tmp = NamedTemporaryFile(delete=False, suffix=".png")
+    fig.savefig(tmp.name, bbox_inches="tight", dpi=100)
+    plt.close(fig)
+    return tmp.name
+
+# ---------------- Telegram helpers ----------------
+async def send_text(session, text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram not configured. Skipping send_text.")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        async with session.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}) as r:
+            if r.status != 200:
+                txt = await r.text()
+                print(f"Telegram send_text failed {r.status}: {txt}")
+    except Exception as e:
+        print("send_text error:", e)
+
+async def send_photo(session, caption, path):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram not configured. Skipping send_photo.")
         try:
-            url = f"{self.base_url}/sendMessage"
-            payload = {
-                "chat_id": self.chat_id,
-                "text": text[:4096],  # Telegram limit
-                "parse_mode": parse_mode
+            os.remove(path)
+        except:
+            pass
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    try:
+        with open(path, "rb") as f:
+            data = aiohttp.FormData()
+            data.add_field("chat_id", str(TELEGRAM_CHAT_ID))
+            data.add_field("caption", caption)
+            data.add_field("photo", f, filename=os.path.basename(path), content_type="image/png")
+            async with session.post(url, data=data, timeout=60) as r:
+                if r.status != 200:
+                    text = await r.text()
+                    print(f"Telegram send_photo failed {r.status}: {text}")
+    except Exception as e:
+        print("send_photo error:", e)
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+# ---------------- Enhanced Parsing & Main Loop ----------------
+def enhanced_parse(text):
+    """Enhanced parsing with better signal validation"""
+    out = {}
+    if not text:
+        return out
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or not any(x in line.upper() for x in ["BUY", "SELL"]):
+            continue
+
+        parts = [p.strip() for p in line.split(" - ")]
+        if len(parts) < 3:
+            continue
+
+        symbol = parts[0].upper()
+        action = parts[1].upper()
+        reason = parts[2]
+
+        # Extract confidence
+        conf = None
+        conf_text = line.upper()
+        if "CONF" in conf_text:
+            try:
+                idx = conf_text.index("CONF")
+                remaining = conf_text[idx:]
+                digits = "".join(c for c in remaining if c.isdigit())
+                if digits:
+                    conf = int(digits)
+            except:
+                pass
+
+        # Validate signal quality
+        if action in ["BUY", "SELL"] and conf and conf >= 70:
+            out[symbol] = {
+                "action": action,
+                "reason": reason,
+                "confidence": conf,
+                "timestamp": datetime.now()
             }
-            
-            async with session.post(url, json=payload) as response:
-                if response.status != 200:
-                    logger.error(f"Telegram message failed: {response.status}")
-        
-        except Exception as e:
-            logger.error(f"Telegram message error: {e}")
-    
-    async def send_photo(self, session, caption, photo_path):
-        if not self.bot_token or not self.chat_id:
-            logger.info(f"[TELEGRAM PHOTO] {caption}")
-            try:
-                os.unlink(photo_path)
-            except:
-                pass
-            return
-        
-        try:
-            url = f"{self.base_url}/sendPhoto"
-            
-            with open(photo_path, 'rb') as photo:
-                data = aiohttp.FormData()
-                data.add_field('chat_id', self.chat_id)
-                data.add_field('caption', caption[:1024])  # Telegram limit
-                data.add_field('photo', photo, filename=os.path.basename(photo_path))
-                
-                async with session.post(url, data=data) as response:
-                    if response.status != 200:
-                        logger.error(f"Telegram photo failed: {response.status}")
-        
-        except Exception as e:
-            logger.error(f"Telegram photo error: {e}")
-        finally:
-            try:
-                os.unlink(photo_path)
-            except:
-                pass
 
-telegram_notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+    return out
 
-# ---------------- MARKET SCANNER ----------------
-class MarketScanner:
-    def __init__(self, symbols):
-        self.symbols = symbols
-    
-    async def scan_all_symbols(self, session):
-        """Scan all symbols for trading opportunities"""
-        signals = []
-        
-        # Check rate limits
-        recent_signals = db.get_recent_signals_count(hours=1)
-        if recent_signals >= MAX_SIGNALS_PER_HOUR:
-            logger.warning(f"Signal rate limit reached: {recent_signals}/{MAX_SIGNALS_PER_HOUR}")
-            return []
-        
-        for symbol in self.symbols:
-            try:
-                signal = await self.analyze_symbol(session, symbol)
-                if signal and signal.get("side") != "none":
-                    signal["symbol"] = symbol
-                    signals.append(signal)
-                    logger.info(f"✅ Found signal for {symbol}: {signal.get('side')} ({signal.get('confidence', 0):.1f}%)")
-                else:
-                    logger.debug(f"❌ No signal for {symbol}")
-            
-            except Exception as e:
-                logger.error(f"Error analyzing {symbol}: {e}")
-                continue
-        
-        # Sort by confidence
-        signals.sort(key=lambda x: x.get("confidence", 0), reverse=True)
-        return signals[:3]  # Return top 3 signals
-    
-    async def analyze_symbol(self, session, symbol):
-        """Analyze a single symbol"""
-        try:
-            # Fetch candle data
-            c30m_data = await fetch_json_with_retry(session, 
-                CANDLE_URL.format(symbol=symbol, interval="30m", limit=100))
-            c1h_data = await fetch_json_with_retry(session, 
-                CANDLE_URL.format(symbol=symbol, interval="1h", limit=100))
-            
-            if not c30m_data or not c1h_data:
-                logger.warning(f"Failed to fetch data for {symbol}")
-                return None
-            
-            # Filter valid candles
-            c30m = [c for c in c30m_data if c and len(c) >= 6]
-            c1h = [c for c in c1h_data if c and len(c) >= 6]
-            
-            if len(c30m) < 30 or len(c1h) < 30:
-                logger.warning(f"Insufficient data for {symbol}")
-                return None
-            
-            # Multi-timeframe analysis
-            signal = multi_tf_confirmation(c30m, c1h)
-            
-            logger.debug(f"{symbol}: {signal.get('side')} - {signal.get('confidence', 0):.1f}% - {signal.get('reason', '')[:50]}")
-            
-            # Check if signal meets threshold
-            if (signal.get("side") != "none" and 
-                signal.get("confidence", 0) >= SIGNAL_CONF_THRESHOLD):
-                
-                # Get AI confirmation
-                ai_confirmation = await get_ai_confirmation(symbol, signal)
-                if ai_confirmation and "CONFIRM" in ai_confirmation.upper():
-                    signal["confidence"] = min(100, signal.get("confidence", 0) + 5)
-                    signal["ai_analysis"] = ai_confirmation
-                
-                # Generate chart
-                chart_path = plot_signal_chart(symbol, c30m, signal)
-                if chart_path:
-                    signal["chart_path"] = chart_path
-                
-                return signal
-            
-            return None
-        
-        except Exception as e:
-            logger.error(f"Symbol analysis error for {symbol}: {e}")
-            return None
+async def enhanced_loop():
+    """Main enhanced loop with better error handling and signal tracking"""
+    async with aiohttp.ClientSession() as session:
+        startup_msg = f"""🤖 *Enhanced Crypto Bot v6.0 Online*
 
-# ---------------- SIGNAL PROCESSING ----------------
-async def process_signal(session, signal):
-    """Process and send a trading signal"""
-    try:
-        symbol = signal.get("symbol", "UNKNOWN")
-        side = signal.get("side", "")
-        entry = signal.get("entry", 0)
-        sl = signal.get("sl", 0)
-        tp = signal.get("tp", 0)
-        confidence = signal.get("confidence", 0)
-        risk_reward = signal.get("risk_reward", 0)
-        reason = signal.get("reason", "")
-        indicators = signal.get("indicators", {})
-        
-        # Format message
-        message = f"""🎯 *{symbol} {side} SIGNAL*
+📊 *Configuration:*
+• Symbols: {len(SYMBOLS)}
+• Confidence Threshold: ≥{SIGNAL_CONF_THRESHOLD}%
+• Poll Interval: {POLL_INTERVAL}s
+• Enhanced Analysis: ✅
+• Technical Indicators: RSI, MA, S/R, Patterns
+• Order Book Analysis: ✅
 
-💰 Entry: `{fmt_price(entry)}`
-🛑 Stop Loss: `{fmt_price(sl)}`
-🎯 Take Profit: `{fmt_price(tp)}`
-📊 Confidence: *{confidence:.1f}%*
-📈 Risk/Reward: *{risk_reward:.2f}*
+🎯 *Ready for high-quality signals!*"""
 
-📍 RSI: {indicators.get('rsi', 0):.1f}
-📍 EMA9: {fmt_price(indicators.get('ema_9', 0))}
-📍 EMA21: {fmt_price(indicators.get('ema_21', 0))}
+        await send_text(session, startup_msg)
 
-🔍 Reason: {reason[:200]}
-
-⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"""
-        
-        # Send with chart if available
-        chart_path = signal.get("chart_path")
-        if chart_path and os.path.exists(chart_path):
-            await telegram_notifier.send_photo(session, message, chart_path)
-        else:
-            await telegram_notifier.send_message(session, message)
-        
-        # Save to database
-        db.save_signal({
-            "symbol": symbol,
-            "side": side,
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "confidence": confidence,
-            "reason": reason
-        })
-        
-        logger.info(f"✅ Signal sent for {symbol} {side}")
-        
-    except Exception as e:
-        logger.error(f"Error processing signal: {e}")
-
-# ---------------- MAIN LOOP ----------------
-async def enhanced_trading_loop():
-    """Main trading loop"""
-    scanner = MarketScanner(SYMBOLS)
-    
-    connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
-    timeout = aiohttp.ClientTimeout(total=30, connect=10)
-    
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        # Send startup message
-        startup_message = f"""🚀 *Enhanced Crypto Trading Bot v4.1 Started*
-
-📊 Monitoring: {len(SYMBOLS)} symbols
-⏱️ Scan interval: {POLL_INTERVAL} seconds
-🎯 Confidence threshold: {SIGNAL_CONF_THRESHOLD}%
-📈 Max signals/hour: {MAX_SIGNALS_PER_HOUR}
-
-Bot is now scanning markets for opportunities..."""
-        
-        await telegram_notifier.send_message(session, startup_message)
-        logger.info("🚀 Trading bot started successfully!")
-        
         iteration = 0
-        last_stats_time = time.time()
-        
         while True:
-            iteration += 1
-            start_time = time.time()
-            
             try:
-                logger.info(f"\n{'='*20} SCAN {iteration} @ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} {'='*20}")
-                
-                # Scan all symbols
-                signals = await scanner.scan_all_symbols(session)
-                
-                scan_duration = time.time() - start_time
-                logger.info(f"Scan completed in {scan_duration:.1f}s - Found {len(signals)} signals")
-                
-                # Process signals
-                for signal in signals:
-                    try:
-                        await process_signal(session, signal)
-                        # Small delay between signals
-                        await asyncio.sleep(2)
-                    except Exception as e:
-                        logger.error(f"Error processing signal: {e}")
-                
-                # Send periodic stats (every 4 hours)
-                if time.time() - last_stats_time > 14400:
-                    stats_message = f"""📊 *Bot Statistics Update*
+                iteration += 1
+                print(f"\n🔄 Starting iteration {iteration} at {datetime.now()}")
 
-🔄 Scans completed: {iteration}
-⏰ Runtime: {(time.time() - start_time)/3600:.1f} hours
-💾 Recent signals: {db.get_recent_signals_count(hours=24)} (24h)
+                # Fetch enhanced data for all symbols
+                fetch_tasks = [fetch_enhanced_data(session, symbol) for symbol in SYMBOLS]
+                results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
 
-Bot is running normally..."""
-                    
-                    await telegram_notifier.send_message(session, stats_message)
-                    last_stats_time = time.time()
-                
-                # Dynamic sleep time
+                # Build market data dict, handling exceptions
+                market = {}
+                for symbol, result in zip(SYMBOLS, results):
+                    if isinstance(result, Exception):
+                        print(f"Error fetching {symbol}: {result}")
+                        continue
+                    if result and result.get("price") is not None:
+                        market[symbol] = result
+
+                if not market:
+                    print("No valid market data received, skipping analysis")
+                    await asyncio.sleep(min(60, POLL_INTERVAL))
+                    continue
+
+                print(f"📊 Analyzing {len(market)} symbols...")
+
+                # Enhanced analysis
+                analysis_result = await enhanced_analyze_openai(market)
+                if not analysis_result:
+                    print("No analysis result from AI, continuing...")
+                    await asyncio.sleep(POLL_INTERVAL)
+                    continue
+
+                # Parse signals
+                signals = enhanced_parse(analysis_result)
+
                 if signals:
-                    # If we found signals, scan more frequently
-                    sleep_time = max(300, POLL_INTERVAL // 3)  # Minimum 5 minutes
-                    logger.info(f"Found {len(signals)} signals - next scan in {sleep_time}s")
+                    print(f"🎯 Found {len(signals)} potential signals")
+
+                    for symbol, signal in signals.items():
+                        try:
+                            confidence = signal["confidence"]
+                            action = signal["action"]
+
+                            if confidence >= SIGNAL_CONF_THRESHOLD:
+                                print(f"📢 High-confidence signal: {symbol} {action} ({confidence}%)")
+
+                                # Get market data for this symbol
+                                symbol_data = market.get(symbol, {})
+
+                                # define price safely
+                                price = symbol_data.get("price") if symbol_data else None
+
+                                # Create enhanced chart
+                                if symbol_data.get("candles") and symbol_data.get("times"):
+                                    try:
+                                        chart_path = enhanced_plot_chart(
+                                            symbol_data["times"],
+                                            symbol_data["candles"],
+                                            symbol,
+                                            symbol_data
+                                        )
+
+                                        # Create comprehensive caption
+                                        rsi = symbol_data.get("rsi", "N/A")
+                                        volume_spike = "🔥 VOLUME SPIKE" if symbol_data.get("volume_spike") else ""
+
+                                        patterns = symbol_data.get("patterns", {})
+                                        active_patterns = [k.replace("_", " ").title() for k, v in patterns.items() if v]
+                                        pattern_text = f"\n🔍 Patterns: {', '.join(active_patterns)}" if active_patterns else ""
+
+                                        # Fix price formatting in caption (handle missing price)
+                                        if price is None:
+                                            price_display = "N/A"
+                                        elif price < 1:
+                                            price_display = f"{price:.6f}"
+                                        else:
+                                            price_display = f"{price:.2f}"
+
+                                        caption = f"""🚨 *{symbol}* → *{action}*
+💰 Price: ${price_display}
+📊 RSI: {rsi}
+🎯 Confidence: {confidence}%
+{volume_spike}
+{pattern_text}
+
+💡 *Analysis:*
+{signal['reason']}
+
+⏰ {datetime.now().strftime('%H:%M:%S UTC')}"""
+
+                                        await send_photo(session, caption, chart_path)
+
+                                        # Track signal for performance monitoring
+                                        signal_history.append({
+                                            "symbol": symbol,
+                                            "action": action,
+                                            "confidence": confidence,
+                                            "price": price,
+                                            "timestamp": datetime.now(),
+                                            "reason": signal["reason"]
+                                        })
+
+                                        # Keep only last 50 signals
+                                        if len(signal_history) > 50:
+                                            signal_history.pop(0)
+
+                                    except Exception as e:
+                                        print(f"Error creating chart for {symbol}: {e}")
+
+                                        # Send text-only signal if chart fails
+                                        if price is None:
+                                            price_display = "N/A"
+                                        elif price < 1:
+                                            price_display = f"{price:.6f}"
+                                        else:
+                                            price_display = f"{price:.2f}"
+                                        simple_caption = f"🚨 {symbol} → {action}\nPrice: ${price_display}\nConf: {confidence}%\n{signal['reason']}"
+                                        await send_text(session, simple_caption)
+
+                        except Exception as e:
+                            print(f"Error processing signal for {symbol}: {e}")
+                            traceback.print_exc()
                 else:
-                    # No signals, use normal interval
-                    sleep_time = POLL_INTERVAL
-                    logger.info(f"No signals found - next scan in {sleep_time}s")
-                
-                await asyncio.sleep(sleep_time)
-            
+                    print("No high-confidence signals found in this iteration")
+
+                # Send periodic status update every 10 iterations
+                if iteration % 10 == 0:
+                    total_signals = len(signal_history)
+                    recent_signals = len([s for s in signal_history if
+                                        (datetime.now() - s["timestamp"]).total_seconds() < 3600])  # Last hour
+
+                    status_msg = f"""📈 *Bot Status Update - Iteration {iteration}*
+
+🔍 *Market Scan:* {len(market)} symbols analyzed
+📊 *Total Signals Today:* {total_signals}
+🕐 *Signals Last Hour:* {recent_signals}
+⚡ *Next Scan:* {POLL_INTERVAL}s
+
+🤖 *Bot running smoothly...*"""
+
+                    await send_text(session, status_msg)
+
+                print(f"✅ Iteration {iteration} completed. Waiting {POLL_INTERVAL}s...")
+                await asyncio.sleep(POLL_INTERVAL)
+
+            except asyncio.CancelledError:
+                print("Bot shutting down...")
+                raise
             except Exception as e:
-                logger.error(f"Main loop error: {e}")
-                logger.error(traceback.format_exc())
-                
+                print(f"Main loop error in iteration {iteration}: {e}")
+                traceback.print_exc()
+
                 # Send error notification
-                error_message = f"🚨 *Bot Error*\n\n`{str(e)[:500]}`\n\nBot will continue in 60 seconds..."
-                await telegram_notifier.send_message(session, error_message)
-                
-                # Wait before retrying
-                await asyncio.sleep(60)
+                error_msg = f"⚠️ *Bot Error - Iteration {iteration}*\n```\n{str(e)[:200]}\n```\nRetrying in 60s..."
+                await send_text(session, error_msg)
 
-# ---------------- CLI HELPERS ----------------
-async def test_single_symbol(symbol):
-    """Test analysis for a single symbol"""
-    scanner = MarketScanner([symbol])
-    
-    async with aiohttp.ClientSession() as session:
-        logger.info(f"Testing analysis for {symbol}...")
-        
-        try:
-            signal = await scanner.analyze_symbol(session, symbol)
-            
-            if signal:
-                print(f"\n✅ Signal found for {symbol}:")
-                print(f"Side: {signal.get('side')}")
-                print(f"Confidence: {signal.get('confidence', 0):.1f}%")
-                print(f"Entry: {fmt_price(signal.get('entry', 0))}")
-                print(f"SL: {fmt_price(signal.get('sl', 0))}")
-                print(f"TP: {fmt_price(signal.get('tp', 0))}")
-                print(f"R/R: {signal.get('risk_reward', 0):.2f}")
-                print(f"Reason: {signal.get('reason', '')}")
-                
-                # Generate chart
-                chart_path = signal.get('chart_path')
-                if chart_path:
-                    print(f"Chart saved to: {chart_path}")
-            else:
-                print(f"\n❌ No signal found for {symbol}")
-        
-        except Exception as e:
-            print(f"\n🚨 Error testing {symbol}: {e}")
+                # Backoff on error
+                await asyncio.sleep(min(60, POLL_INTERVAL))
 
-async def run_single_scan():
-    """Run a single scan of all symbols"""
-    scanner = MarketScanner(SYMBOLS)
-    
-    async with aiohttp.ClientSession() as session:
-        logger.info("Running single scan of all symbols...")
-        
-        try:
-            signals = await scanner.scan_all_symbols(session)
-            
-            print(f"\n📊 Scan Results: {len(signals)} signals found")
-            print("-" * 60)
-            
-            for i, signal in enumerate(signals, 1):
-                symbol = signal.get('symbol', 'UNKNOWN')
-                side = signal.get('side', '')
-                confidence = signal.get('confidence', 0)
-                reason = signal.get('reason', '')
-                
-                print(f"{i}. {symbol} - {side} ({confidence:.1f}%)")
-                print(f"   Reason: {reason[:60]}...")
-                print()
-        
-        except Exception as e:
-            print(f"\n🚨 Error during scan: {e}")
+# ---------------- Risk Management Functions ----------------
+def calculate_position_size(account_balance: float, risk_percentage: float, entry_price: float, stop_loss: float) -> float:
+    """Calculate position size based on risk management"""
+    if not all([account_balance, risk_percentage, entry_price, stop_loss]) or entry_price == stop_loss:
+        return 0
 
-# ---------------- MAIN ----------------
-if __name__ == "__main__":
-    import sys
-    
-    try:
-        if len(sys.argv) > 1:
-            command = sys.argv[1]
-            
-            if command == "test" and len(sys.argv) > 2:
-                # Test single symbol: python main.py test BTCUSDT
-                symbol = sys.argv[2]
-                asyncio.run(test_single_symbol(symbol))
-            
-            elif command == "scan":
-                # Run single scan: python main.py scan
-                asyncio.run(run_single_scan())
-            
-            else:
-                print("Usage:")
-                print("  python main.py              # Run main bot")
-                print("  python main.py test SYMBOL  # Test single symbol")
-                print("  python main.py scan          # Run single scan")
-        
+    risk_amount = account_balance * (risk_percentage / 100)
+    price_difference = abs(entry_price - stop_loss)
+    position_size = risk_amount / price_difference
+
+    return round(position_size, 6)
+
+def calculate_take_profit(entry_price: float, stop_loss: float, risk_reward_ratio: float = 2.0) -> float:
+    """Calculate take profit based on risk-reward ratio"""
+    if not entry_price or not stop_loss:
+        return None
+
+    risk = abs(entry_price - stop_loss)
+    reward = risk * risk_reward_ratio
+
+    if entry_price > stop_loss:  # Long position
+        return entry_price + reward
+    else:  # Short position
+        return entry_price - reward
+
+def analyze_market_structure(candles, current_price: float) -> dict:
+    """Analyze market structure for better entry timing"""
+    if len(candles) < 20:
+        return {"trend": "UNKNOWN", "structure": "UNCLEAR"}
+
+    recent_candles = candles[-20:]
+    highs = [c[1] for c in recent_candles]  # High prices
+    lows = [c[2] for c in recent_candles]   # Low prices
+    closes = [c[3] for c in recent_candles] # Close prices
+
+    recent_highs = []
+    recent_lows = []
+
+    for i in range(2, len(recent_candles) - 2):
+        if (highs[i] > highs[i-1] and highs[i] > highs[i-2] and
+            highs[i] > highs[i+1] and highs[i] > highs[i+2]):
+            recent_highs.append(highs[i])
+
+        if (lows[i] < lows[i-1] and lows[i] < lows[i-2] and
+            lows[i] < lows[i+1] and lows[i] < lows[i+2]):
+            recent_lows.append(lows[i])
+
+    trend = "SIDEWAYS"
+    if len(recent_highs) >= 2 and len(recent_lows) >= 2:
+        if recent_highs[-1] > recent_highs[-2] and recent_lows[-1] > recent_lows[-2]:
+            trend = "UPTREND"
+        elif recent_highs[-1] < recent_highs[-2] and recent_lows[-1] < recent_lows[-2]:
+            trend = "DOWNTREND"
+
+    structure = "UNCLEAR"
+    if recent_highs and recent_lows:
+        nearest_high = min(recent_highs, key=lambda x: abs(x - current_price))
+        nearest_low = min(recent_lows, key=lambda x: abs(x - current_price))
+
+        if abs(current_price - nearest_high) < abs(current_price - nearest_low):
+            structure = "NEAR_RESISTANCE"
         else:
-            # Run main bot
-            logger.info("Starting Enhanced Crypto Trading Bot v4.1")
-            asyncio.run(enhanced_trading_loop())
-    
+            structure = "NEAR_SUPPORT"
+
+    return {
+        "trend": trend,
+        "structure": structure,
+        "recent_highs": recent_highs[-3:] if recent_highs else [],
+        "recent_lows": recent_lows[-3:] if recent_lows else [],
+        "strength": len(recent_highs) + len(recent_lows)
+    }
+
+# ---------------- Performance Tracking ----------------
+def calculate_signal_performance() -> dict:
+    """Calculate bot performance metrics"""
+    if len(signal_history) < 5:
+        return {"insufficient_data": True}
+
+    total_signals = len(signal_history)
+    buy_signals = len([s for s in signal_history if s["action"] == "BUY"])
+    sell_signals = len([s for s in signal_history if s["action"] == "SELL"])
+
+    avg_confidence = sum(s["confidence"] for s in signal_history) / total_signals
+
+    symbol_counts = {}
+    for signal in signal_history:
+        symbol = signal["symbol"]
+        symbol_counts[symbol] = symbol_counts.get(symbol, 0) + 1
+
+    most_active = sorted(symbol_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+
+    recent_cutoff = datetime.now() - timedelta(hours=24)
+    recent_signals = [s for s in signal_history if s["timestamp"] > recent_cutoff]
+
+    return {
+        "total_signals": total_signals,
+        "buy_signals": buy_signals,
+        "sell_signals": sell_signals,
+        "avg_confidence": round(avg_confidence, 1),
+        "most_active_symbols": most_active,
+        "signals_24h": len(recent_signals),
+        "last_signal_time": signal_history[-1]["timestamp"] if signal_history else None
+    }
+
+# ---------------- Main Execution ----------------
+if __name__ == "__main__":
+    print("🚀 Starting Enhanced Crypto Trading Bot v6.0...")
+    print(f"📊 Monitoring {len(SYMBOLS)} symbols")
+    print(f"🎯 Signal confidence threshold: {SIGNAL_CONF_THRESHOLD}%")
+    print(f"⏱️  Poll interval: {POLL_INTERVAL} seconds")
+    print(f"🔧 Enhanced features: RSI, MA, S/R, Patterns, Order Book")
+
+    try:
+        asyncio.run(enhanced_loop())
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        print("\n👋 Bot stopped by user. Goodbye!")
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        logger.error(traceback.format_exc())
+        print(f"\n💥 Critical error: {e}")
+        traceback.print_exc()
