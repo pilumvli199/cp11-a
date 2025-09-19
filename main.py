@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# main.py - Enhanced Crypto Trading Bot v5.0 (Major Improvements)
+# main.py - Enhanced Crypto Trading Bot v5.0 (Patched: concurrency-safe RateLimiter + safer concurrency)
 import os, re, asyncio, aiohttp, traceback, numpy as np, json, logging
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Tuple
 import sqlite3
 from contextlib import asynccontextmanager
 import time
+import math
 
 load_dotenv()
 
@@ -109,27 +110,53 @@ class SignalDatabase:
 
 db = SignalDatabase()
 
-# ---------------- RATE LIMITING ----------------
+# ---------------- RATE LIMITING (fixed concurrency-safe) ----------------
 class RateLimiter:
-    def __init__(self, max_requests=10, window_seconds=60):
+    """
+    Concurrency-safe sliding-window rate limiter.
+    Ensures only `max_requests` timestamps exist inside the last `window_seconds`.
+    Uses an asyncio.Lock to serialize access so we don't print multiple wait lines.
+    """
+    def __init__(self, max_requests=8, window_seconds=60):
         self.max_requests = max_requests
         self.window_seconds = window_seconds
-        self.requests = []
-    
-    async def wait_if_needed(self):
-        now = time.time()
-        # Remove old requests
-        self.requests = [req_time for req_time in self.requests if now - req_time < self.window_seconds]
-        
-        if len(self.requests) >= self.max_requests:
-            sleep_time = self.window_seconds - (now - self.requests[0])
-            if sleep_time > 0:
-                logger.info(f"Rate limit reached, waiting {sleep_time:.2f}s")
-                await asyncio.sleep(sleep_time)
-        
-        self.requests.append(now)
+        self.requests: List[float] = []
+        self._lock = asyncio.Lock()
 
-rate_limiter = RateLimiter()
+    async def wait_if_needed(self):
+        # First acquire lock to inspect/update shared timestamps
+        async with self._lock:
+            now = time.time()
+            # drop old requests outside the window
+            self.requests = [t for t in self.requests if now - t < self.window_seconds]
+
+            if len(self.requests) < self.max_requests:
+                # allowed immediately — register this request timestamp and return
+                self.requests.append(now)
+                return
+
+            # rate limit hit — compute how long until the oldest request leaves the window
+            oldest = self.requests[0]
+            sleep_time = self.window_seconds - (now - oldest)
+            if sleep_time <= 0:
+                # race edge-case: by the time we computed, window freed
+                self.requests = [t for t in self.requests if now - t < self.window_seconds]
+                self.requests.append(now)
+                return
+
+            # log once and prepare to sleep
+            logger.info(f"Rate limit reached, waiting {sleep_time:.2f}s")
+
+        # Release lock while sleeping to avoid blocking everything
+        await asyncio.sleep(sleep_time)
+
+        # after sleeping, re-enter critical section to update timestamps safely
+        async with self._lock:
+            now2 = time.time()
+            self.requests = [t for t in self.requests if now2 - t < self.window_seconds]
+            self.requests.append(now2)
+
+rate_limiter = RateLimiter()  # defaults: 8 req / 60s
 
 # ---------------- ENHANCED UTILS ----------------
 def fmt_price(p: float) -> str:
@@ -172,36 +199,6 @@ def calculate_rsi(closes: List[float], period: int = RSI_PERIOD) -> List[float]:
     
     return rsi_values
 
-def calculate_macd(closes: List[float]) -> Dict[str, List[float]]:
-    """Calculate MACD indicator"""
-    if len(closes) < MACD_SLOW:
-        return {"macd": [], "signal": [], "histogram": []}
-    
-    ema_fast = ema(closes, MACD_FAST)
-    ema_slow = ema(closes, MACD_SLOW)
-    
-    macd_line = []
-    start_idx = max(len(ema_fast) - len([x for x in ema_fast if x is not None]),
-                   len(ema_slow) - len([x for x in ema_slow if x is not None]))
-    
-    for i in range(start_idx, len(closes)):
-        if ema_fast[i] is not None and ema_slow[i] is not None:
-            macd_line.append(ema_fast[i] - ema_slow[i])
-    
-    signal_line = ema(macd_line, MACD_SIGNAL)
-    
-    histogram = []
-    signal_start = len(signal_line) - len([x for x in signal_line if x is not None])
-    for i in range(signal_start, len(macd_line)):
-        if i < len(signal_line) and signal_line[i] is not None:
-            histogram.append(macd_line[i] - signal_line[i])
-    
-    return {
-        "macd": macd_line,
-        "signal": [x for x in signal_line if x is not None],
-        "histogram": histogram
-    }
-
 def ema(values: List[float], period: int) -> List[float]:
     """Enhanced EMA calculation with better handling"""
     if len(values) < period:
@@ -220,6 +217,35 @@ def ema(values: List[float], period: int) -> List[float]:
         ema_values.append(ema_val)
     
     return ema_values
+
+def calculate_macd(closes: List[float]) -> Dict[str, List[float]]:
+    """Calculate MACD indicator"""
+    if len(closes) < MACD_SLOW:
+        return {"macd": [], "signal": [], "histogram": []}
+    
+    ema_fast = ema(closes, MACD_FAST)
+    ema_slow = ema(closes, MACD_SLOW)
+    
+    macd_line = []
+    # align start
+    for i in range(len(closes)):
+        f = ema_fast[i] if i < len(ema_fast) else None
+        s = ema_slow[i] if i < len(ema_slow) else None
+        if f is not None and s is not None:
+            macd_line.append(f - s)
+    
+    signal_line = ema(macd_line, MACD_SIGNAL) if macd_line else []
+    histogram = []
+    if signal_line:
+        for i in range(len(signal_line)):
+            if i < len(macd_line):
+                histogram.append(macd_line[i] - signal_line[i])
+    
+    return {
+        "macd": macd_line,
+        "signal": [x for x in signal_line if x is not None],
+        "histogram": histogram
+    }
 
 def detect_pattern(highs: List[float], lows: List[float], closes: List[float]) -> Dict:
     """Detect common chart patterns"""
@@ -564,7 +590,7 @@ def plot_simple_chart(symbol: str, candles: List[List], signal: Dict) -> str:
 @asynccontextmanager
 async def get_session():
     """Context manager for aiohttp session with retry logic"""
-    connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300, use_dns_cache=True)
+    connector = aiohttp.TCPConnector(limit=40, ttl_dns_cache=300, use_dns_cache=True)
     timeout = aiohttp.ClientTimeout(total=30, connect=10)
     
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
@@ -606,7 +632,7 @@ async def get_enhanced_ai_analysis(symbol: str, candles: List[List], signal: Dic
         # Prepare market data summary
         closes = [float(c[4]) for c in candles[-20:]]
         current_price = closes[-1]
-        price_change_24h = ((current_price - closes[0]) / closes[0]) * 100
+        price_change_24h = ((current_price - closes[0]) / closes[0]) * 100 if closes[0] != 0 else 0
         
         market_summary = {
             "symbol": symbol,
@@ -734,12 +760,15 @@ class MarketScanner:
             return []
         
         tasks = []
+        # small stagger when scheduling tasks to avoid instant burst
         for symbol in self.symbols:
+            # schedule analyze_symbol tasks but stagger a bit
             task = asyncio.create_task(self.analyze_symbol(session, symbol))
             tasks.append(task)
+            await asyncio.sleep(0.12)  # 120ms stagger between scheduling requests
         
         # Process symbols concurrently with semaphore to limit concurrent requests
-        semaphore = asyncio.Semaphore(5)
+        semaphore = asyncio.Semaphore(3)  # reduced concurrency to avoid rate-limit bursts
         
         async def limited_analyze(task):
             async with semaphore:
@@ -930,39 +959,4 @@ async def process_signal(session: aiohttp.ClientSession, signal: Dict):
               f"• EMA21: {fmt_price(indicators.get('ema_21', 0))}\n\n"
               f"📝 *Reason:* {signal['reason'][:200]}...\n\n"
               f"⏰ {datetime.now().strftime('%H:%M:%S UTC')}")
-    
-    # Add AI analysis if available
-    if signal.get("ai_analysis"):
-        message += f"\n\n🤖 *AI Analysis:*\n`{signal['ai_analysis'][:150]}...`"
-    
-    # Send chart with signal
-    chart_path = signal.get("chart_path")
-    if chart_path:
-        await telegram.send_photo(session, message, chart_path)
-    else:
-        await telegram.send_message(session, message)
-    
-    # Save to database
-    db.save_signal({
-        "symbol": symbol,
-        "side": signal["side"],
-        "entry": signal["entry"],
-        "sl": signal["sl"],
-        "tp": signal["tp"],
-        "confidence": signal["confidence"],
-        "reason": signal["reason"]
-    })
-    
-    logger.info(f"✅ Signal sent: {symbol} {signal['side']} @ {fmt_price(signal['entry'])} "
-               f"(Conf: {signal['confidence']:.1f}%, R/R: {rr_ratio:.2f})")
 
-# ---------------- MAIN ENTRY POINT ----------------
-if __name__ == "__main__":
-    try:
-        logger.info("Starting Enhanced Crypto Trading Bot v5.0")
-        asyncio.run(enhanced_trading_loop())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        logger.error(traceback.format_exc())
