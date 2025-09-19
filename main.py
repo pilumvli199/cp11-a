@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# main.py - Enhanced Crypto Trading Bot v5.0 (Ultra-conservative rate-limit patch)
-import os, asyncio, aiohttp, traceback, numpy as np, json, logging, time, math
+# main.py - Enhanced Crypto Trading Bot v5.0 (1-request-per-second scanning)
+import os, asyncio, aiohttp, traceback, numpy as np, json, logging, time
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -27,7 +27,7 @@ SYMBOLS = [
     "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","AAVEUSDT",
     "TRXUSDT","DOGEUSDT","BNBUSDT","ADAUSDT","LTCUSDT","LINKUSDT"
 ]
-POLL_INTERVAL = max(30, int(os.getenv("POLL_INTERVAL", 1800)))
+POLL_INTERVAL = max(10, int(os.getenv("POLL_INTERVAL", 1800)))  # default large but can be reduced for testing
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -73,10 +73,13 @@ class SignalDatabase:
 
 db = SignalDatabase()
 
-# ---------------- GLOBAL BACKOFF / RATE-LIMITER ----------------
-# Ultra-conservative defaults to avoid repeated "Rate limit reached" logs.
+# ---------------- RATE LIMITER: 1 request per second ----------------
 class RateLimiter:
-    def __init__(self, max_requests=2, window_seconds=60, log_suppress_interval=10.0):
+    """
+    Concurrency-safe sliding-window rate limiter.
+    Configured for 1 request / 1 second by default.
+    """
+    def __init__(self, max_requests=1, window_seconds=1.0, log_suppress_interval=1.0):
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self.requests: List[float] = []
@@ -87,7 +90,7 @@ class RateLimiter:
     async def wait_if_needed(self):
         async with self._lock:
             now = time.time()
-            # prune
+            # drop old
             self.requests = [t for t in self.requests if now - t < self.window_seconds]
             if len(self.requests) < self.max_requests:
                 self.requests.append(now)
@@ -99,22 +102,22 @@ class RateLimiter:
                 self.requests.append(now)
                 return
             if now - self.last_log_time > self.log_suppress_interval:
-                logger.info(f"Rate limit reached, waiting {sleep_time:.2f}s (very conservative mode)")
+                logger.info(f"Rate limit reached (local), waiting {sleep_time:.2f}s")
                 self.last_log_time = now
-        # sleep outside lock
         await asyncio.sleep(sleep_time)
         async with self._lock:
             now2 = time.time()
             self.requests = [t for t in self.requests if now2 - t < self.window_seconds]
             self.requests.append(now2)
 
-rate_limiter = RateLimiter(max_requests=2, window_seconds=60, log_suppress_interval=10.0)
+# instantiate for 1 req/sec
+rate_limiter = RateLimiter(max_requests=1, window_seconds=1.0, log_suppress_interval=1.0)
 
-# When remote sends 429, we set a global backoff until timestamp
+# Global remote backoff when 429 happens
 remote_backoff_until = 0.0
 REMOTE_BACKOFF_DEFAULT = 60  # seconds
 
-# ---------------- UTILITIES / INDICATORS (defensive) ----------------
+# ---------------- UTILITIES / INDICATORS ----------------
 def fmt_price(p):
     try:
         p = float(p)
@@ -130,13 +133,13 @@ def calculate_rsi(closes, period=RSI_PERIOD):
     deltas = [closes[i]-closes[i-1] for i in range(1,len(closes))]
     gains = [d if d>0 else 0 for d in deltas]
     losses = [-d if d<0 else 0 for d in deltas]
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+    avg_gain = sum(gains[:period])/period
+    avg_loss = sum(losses[:period])/period
     rsi_vals=[]
     for i in range(period, len(closes)):
         if avg_loss == 0: rsi = 100.0
         else:
-            rs = avg_gain/avg_loss
+            rs = avg_gain / avg_loss
             rsi = 100 - (100/(1+rs))
         rsi_vals.append(rsi)
         if i < len(deltas):
@@ -156,7 +159,6 @@ def ema(values, period):
         ema_vals.append(values[i]*k + ema_vals[-1]*(1-k))
     return ema_vals
 
-# keep other indicator helpers minimal / defensive
 def calculate_macd(closes):
     if len(closes) < MACD_SLOW: return {"macd":[], "signal":[], "histogram":[]}
     fast = ema(closes, MACD_FAST); slow = ema(closes, MACD_SLOW)
@@ -164,7 +166,8 @@ def calculate_macd(closes):
     for i in range(len(closes)):
         f = fast[i] if i < len(fast) else None
         s = slow[i] if i < len(slow) else None
-        if f is not None and s is not None: macd_line.append(f-s)
+        if f is not None and s is not None:
+            macd_line.append(f-s)
     signal_line = ema(macd_line, MACD_SIGNAL) if macd_line else []
     signal_clean = [x for x in signal_line if x is not None]
     hist = []
@@ -172,10 +175,9 @@ def calculate_macd(closes):
         hist.append(macd_line[i]-signal_clean[i])
     return {"macd": macd_line, "signal": signal_clean, "histogram": hist}
 
-# simple horizontal levels (defensive)
 def horizontal_levels(closes, highs, lows, lookback=50, binsize=0.002):
     if len(closes) < lookback: lookback = len(closes)
-    pts = closes[-lookback:]+highs[-lookback:]+lows[-lookback:]
+    pts = closes[-lookback:] + highs[-lookback:] + lows[-lookback:]
     levels=[]
     for p in pts:
         if p is None or p == 0: continue
@@ -183,15 +185,17 @@ def horizontal_levels(closes, highs, lows, lookback=50, binsize=0.002):
         for lv in levels:
             try:
                 if abs((lv["price"]-p)/p) < binsize:
-                    lv["count"]+=1
-                    lv["price"]=(lv["price"]*(lv["count"]-1)+p)/lv["count"]
+                    lv["count"] += 1
+                    lv["price"] = (lv["price"]*(lv["count"]-1) + p)/lv["count"]
                     found=True; break
-            except: continue
-        if not found: levels.append({"price":p,"count":1})
-    levels.sort(key=lambda x:-x["count"])
-    return [lv["price"] for lv in levels if lv["count"]>=3][:5]
+            except:
+                continue
+        if not found:
+            levels.append({"price": p, "count": 1})
+    levels.sort(key=lambda x: -x["count"])
+    return [lv["price"] for lv in levels if lv["count"] >= 3][:5]
 
-# ---------------- ANALYSIS (defensive, similar to your prior logic) ----------------
+# ---------------- ANALYSIS ----------------
 def analyze_trade_logic(candles, rr_min=1.5):
     try:
         if not candles or len(candles) < 50:
@@ -199,11 +203,11 @@ def analyze_trade_logic(candles, rr_min=1.5):
         cleaned=[]
         for c in candles:
             try:
-                # Binance kline: [openTime, open, high, low, close, volume, ...]
                 if not c or len(c) < 5: continue
                 o=float(c[1]); h=float(c[2]); l=float(c[3]); cl=float(c[4])
                 cleaned.append([o,h,l,cl])
-            except: continue
+            except:
+                continue
         if len(cleaned) < 50:
             return {"side":"none","confidence":0,"reason":"insufficient valid candles after cleaning"}
         closes=[x[3] for x in cleaned]; highs=[x[1] for x in cleaned]; lows=[x[2] for x in cleaned]
@@ -238,7 +242,6 @@ def analyze_trade_logic(candles, rr_min=1.5):
         if cur_rsi is not None:
             if cur_rsi > 70: confidence += 5; reasons.append(f"overbought RSI({cur_rsi:.1f})")
             elif cur_rsi < 30: confidence += 5; reasons.append(f"oversold RSI({cur_rsi:.1f})")
-        # MACD checks (defensive)
         try:
             if macd["macd"] and macd["signal"]:
                 mcur = macd["macd"][-1]; scur = macd["signal"][-1]
@@ -250,23 +253,21 @@ def analyze_trade_logic(candles, rr_min=1.5):
                     if prev_m >= scur: confidence += 10; reasons.append("MACD bearish crossover")
         except:
             reasons.append("macd check failed")
-        # make BUY/SELL if RR ok and support/res exist
+        # Construct candidates if levels exist and confidence satisfy
         if support is not None and resistance is not None and confidence >= 60:
-            # BUY candidate
             entry = current_price
             sl = support * 0.995
             tp = resistance * 0.995
             denom = (entry - sl)
             if denom > 0:
-                rr = (tp - entry) / denom
+                rr = (tp - entry)/denom
                 if rr >= rr_min:
                     return {"side":"BUY","entry":entry,"sl":sl,"tp":tp,"confidence":min(95,confidence+10),"reason":"; ".join(reasons),"risk_reward":rr,"indicators":{"rsi":cur_rsi,"ema_9":cur_ema9,"ema_21":cur_ema21}}
-            # SELL candidate
             sl_s = resistance * 1.005
             tp_s = support * 1.005
             denom2 = (sl_s - entry)
             if denom2 > 0:
-                rr2 = (entry - tp_s) / denom2
+                rr2 = (entry - tp_s)/denom2
                 if rr2 >= rr_min:
                     return {"side":"SELL","entry":entry,"sl":sl_s,"tp":tp_s,"confidence":min(95,confidence+10),"reason":"; ".join(reasons),"risk_reward":rr2,"indicators":{"rsi":cur_rsi,"ema_9":cur_ema9,"ema_21":cur_ema21}}
         return {"side":"none","confidence":confidence,"reason":"; ".join(reasons),"indicators":{"rsi":cur_rsi or 50,"ema_9":cur_ema9 or current_price,"ema_21":cur_ema21 or current_price}}
@@ -283,12 +284,12 @@ def multi_tf_confirmation(c30m, c1h, c4h=None):
         if c4h:
             s4 = analyze_trade_logic(c4h)
             if s4.get("side") == s30["side"]: boost += 10
-        out = s30.copy(); out["confidence"] = min(100, s30.get("confidence",0)+boost)
+        out = s30.copy(); out["confidence"] = min(100, s30.get("confidence",0) + boost)
         out["reason"] = out.get("reason","") + f"; aligned with 1h TF (conf:{s1.get('confidence',0)}%)"
         return out
     return {"side":"none","confidence":0,"reason":f"TF conflict:30m={s30.get('side')},1h={s1.get('side')}"}
 
-# ---------------- CHARTS (kept simple and defensive) ----------------
+# ---------------- CHART (simple) ----------------
 def plot_simple_chart(symbol, candles, signal):
     try:
         good=[]
@@ -307,50 +308,30 @@ def plot_simple_chart(symbol, candles, signal):
     except Exception as e:
         logger.error(f"plot_simple_chart failed: {e}"); tmp=NamedTemporaryFile(delete=False,suffix=".png"); plt.figure(); plt.text(0.5,0.5,"Chart error",ha='center'); plt.savefig(tmp.name); plt.close(); return tmp.name
 
-def plot_advanced_chart(symbol, candles, signal):
-    # try advanced but fallback to simple
-    try:
-        good=[] 
-        for row in candles[-100:]:
-            try:
-                t=int(row[0]); o=float(row[1]); h=float(row[2]); l=float(row[3]); c=float(row[4]); v=float(row[5])
-                good.append([t,o,h,l,c,v])
-            except: continue
-        if len(good) < 8: return plot_simple_chart(symbol, candles, signal)
-        dates=[datetime.utcfromtimestamp(int(x[0])/1000) for x in good[-50:]]; closes=[x[4] for x in good[-50:]]
-        plt.figure(figsize=(12,6)); plt.plot(dates, closes)
-        if signal.get("side")!="none":
-            try: plt.axhline(signal["entry"],linestyle='--'); plt.axhline(signal["sl"],linestyle='--'); plt.axhline(signal["tp"],linestyle='--')
-            except: pass
-        tmp=NamedTemporaryFile(delete=False,suffix=".png"); plt.savefig(tmp.name,bbox_inches='tight'); plt.close(); return tmp.name
-    except Exception as e:
-        logger.error(f"plot_advanced_chart failed: {e}"); return plot_simple_chart(symbol, candles, signal)
-
 # ---------------- HTTP SESSION & FETCH WITH GLOBAL BACKOFF ----------------
 @asynccontextmanager
 async def get_session():
-    connector = aiohttp.TCPConnector(limit=3, ttl_dns_cache=300, use_dns_cache=True)  # small limit
+    # small connector limit; we rely on per-second scheduling
+    connector = aiohttp.TCPConnector(limit=4, ttl_dns_cache=300, use_dns_cache=True)
     timeout = aiohttp.ClientTimeout(total=30, connect=10)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         yield session
 
 async def fetch_json_with_retry(session, url, max_retries=3):
     global remote_backoff_until
-    # if remote backoff active, wait until it ends
     now = time.time()
     if now < remote_backoff_until:
         wait = remote_backoff_until - now
         logger.info(f"Global remote backoff active, sleeping {wait:.1f}s before request")
         await asyncio.sleep(wait)
-    # enforce local rate limiter
-    await rate_limiter.wait_if_needed()
+    await rate_limiter.wait_if_needed()  # enforce 1 req/sec
     for attempt in range(max_retries):
         try:
             async with session.get(url) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 elif resp.status == 429:
-                    # remote rate-limit: set global backoff and exit
+                    # remote rate-limit: set global backoff and return None
                     logger.warning(f"Remote returned 429 for {url} (attempt {attempt+1}). Setting global backoff {REMOTE_BACKOFF_DEFAULT}s.")
                     remote_backoff_until = time.time() + REMOTE_BACKOFF_DEFAULT
                     await asyncio.sleep(REMOTE_BACKOFF_DEFAULT)
@@ -361,11 +342,10 @@ async def fetch_json_with_retry(session, url, max_retries=3):
             logger.warning(f"Timeout for {url} (attempt {attempt+1})")
         except Exception as e:
             logger.error(f"Request error for {url}: {e}")
-        # exponential backoff between retries
         await asyncio.sleep(min(30, 1 * (2 ** attempt)))
     return None
 
-# ---------------- AI (kept minimal) ----------------
+# ---------------- AI confirmation (minimal) ----------------
 async def get_enhanced_ai_analysis(symbol, candles, signal):
     if not client: return None
     try:
@@ -376,8 +356,8 @@ async def get_enhanced_ai_analysis(symbol, candles, signal):
         if not closes: return None
         current_price = closes[-1]
         market_summary = {"symbol":symbol,"current_price":current_price,"local_signal": {"side":signal.get("side"), "confidence":signal.get("confidence")}}
-        system_prompt = "You are an expert trader. Provide short confirm/reject of the local signal."
-        user_prompt = f"Market Data:\n{json.dumps(market_summary)}\nPlease respond with brief confirmation or NO_SIGNAL."
+        system_prompt = "You are an expert trader. Provide short confirm/reject of the local signal (CONF in %). If no signal, reply NO_SIGNAL."
+        user_prompt = f"Market Data:\n{json.dumps(market_summary)}\nPlease respond with short confirmation or NO_SIGNAL."
         loop = asyncio.get_running_loop()
         def call_openai():
             return client.chat.completions.create(model=OPENAI_MODEL, messages=[{"role":"system","content":system_prompt},{"role":"user","content":user_prompt}], max_tokens=200, temperature=0.2)
@@ -399,7 +379,7 @@ class TelegramNotifier:
         except Exception as e: logger.error(f"Telegram msg err: {e}")
     async def send_photo(self, session, caption, path):
         if not self.bot_token or not self.chat_id:
-            logger.info(f"No Telegram configured, caption: {caption[:120]}"); 
+            logger.info(f"No Telegram configured, caption: {caption[:120]}")
             try: os.unlink(path)
             except: pass
             return
@@ -416,7 +396,7 @@ class TelegramNotifier:
 
 telegram = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
-# ---------------- MARKET SCANNER (very conservative concurrency/stagger) ----------------
+# ---------------- MARKET SCANNER (1 sec per symbol) ----------------
 class MarketScanner:
     def __init__(self, symbols):
         self.symbols = symbols
@@ -426,19 +406,20 @@ class MarketScanner:
         if recent >= MAX_SIGNALS_PER_HOUR:
             logger.warning(f"Signal rate limit reached {recent}/{MAX_SIGNALS_PER_HOUR} per hour"); return []
         tasks=[]
-        # schedule tasks but with long stagger
+        # schedule tasks with 1-second stagger so overall ~N seconds for N symbols
         for symbol in self.symbols:
             tasks.append(asyncio.create_task(self.analyze_symbol(session, symbol)))
-            await asyncio.sleep(1.0)  # <- big stagger to prevent bursts
-        sem = asyncio.Semaphore(1)  # only one symbol at a time
+            await asyncio.sleep(1.0)  # 1 request per second pacing
+        sem = asyncio.Semaphore(1)  # only one symbol processed at a time
         async def limited(t):
             async with sem:
                 return await t
         results = await asyncio.gather(*[limited(t) for t in tasks], return_exceptions=True)
         for i,res in enumerate(results):
-            if isinstance(res, Exception): logger.error(f"Err analyze {self.symbols[i]}: {res}"); continue
+            if isinstance(res, Exception):
+                logger.error(f"Err analyzing {self.symbols[i]}: {res}"); continue
             if res and res.get("side") != "none":
-                res["symbol"]=self.symbols[i]; signals.append(res)
+                res["symbol"] = self.symbols[i]; signals.append(res)
         signals.sort(key=lambda x: x.get("confidence",0), reverse=True)
         return signals[:3]
     async def analyze_symbol(self, session, symbol):
@@ -448,23 +429,21 @@ class MarketScanner:
             c4  = await fetch_json_with_retry(session, CANDLE_URL.format(symbol=symbol, interval="4h", limit=50))
             if not c30 or not c1:
                 logger.warning(f"Failed fetch for {symbol}"); return None
-            c30m = [c for c in c30 if c and len(c)>=5]
-            c1h  = [c for c in c1 if c and len(c)>=5]
-            c4h  = [c for c in c4 if c and len(c)>=5] if c4 else None
-            # Defensive conversion to floats happens inside analyze_trade_logic
+            c30m = [c for c in c30 if c and len(c) >= 5]
+            c1h  = [c for c in c1 if c and len(c) >= 5]
+            c4h  = [c for c in c4 if c and len(c) >= 5] if c4 else None
             signal = multi_tf_confirmation(c30m, c1h, c4h)
             if signal.get("side") != "none" and signal.get("confidence",0) >= SIGNAL_CONF_THRESHOLD:
                 ai = await get_enhanced_ai_analysis(symbol, c30m, signal)
                 if ai and "NO_SIGNAL" not in ai.upper():
-                    signal["confidence"] = min(100, signal.get("confidence",0)+5); signal["ai_analysis"]=ai
-                chart = plot_simple_chart(symbol, c30m, signal)
-                signal["chart_path"] = chart
+                    signal["confidence"] = min(100, signal.get("confidence",0) + 5); signal["ai_analysis"] = ai
+                chart = plot_simple_chart(symbol, c30m, signal); signal["chart_path"] = chart
                 return signal
             return None
         except Exception as e:
             logger.error(f"Symbol analysis error for {symbol}: {e}"); logger.error(traceback.format_exc()); return None
 
-# ---------------- PROCESSING / MAIN LOOP ----------------
+# ---------------- PROCESS SIGNAL & MAIN LOOP ----------------
 async def process_signal(session, signal):
     sym = signal.get("symbol","UNKNOWN"); rr = signal.get("risk_reward",0); ind = signal.get("indicators",{})
     msg = (f"🎯 *{sym} {signal.get('side','')} SIGNAL*\n\n"
@@ -489,25 +468,22 @@ async def process_signal(session, signal):
 async def enhanced_trading_loop():
     scanner = MarketScanner(SYMBOLS)
     async with get_session() as session:
-        startup = (f"🚀 Enhanced Trading Bot v5.0 Started\nSymbols: {len(SYMBOLS)} • Poll: {POLL_INTERVAL}s • Conf≥{SIGNAL_CONF_THRESHOLD}%")
+        startup = (f"🚀 Enhanced Trading Bot v5.0 Started\nSymbols: {len(SYMBOLS)} • Per-second pacing: 1 symbol/sec\nScan interval: {POLL_INTERVAL}s • Conf≥{SIGNAL_CONF_THRESHOLD}%")
         logger.info("Trading bot started successfully!"); await telegram.send_message(session, startup)
-        iteration=0; last_stats=time.time()
+        iteration = 0; last_stats = time.time()
         while True:
-            iteration+=1; start=time.time()
+            iteration += 1; start = time.time()
             try:
                 logger.info(f"\n=== SCAN {iteration} @ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} ===")
                 signals = await scanner.scan_all_symbols(session)
                 logger.info(f"Scan done in {time.time()-start:.1f}s — signals: {len(signals)}")
                 for s in signals:
                     try:
-                        await process_signal(session, s)
-                        await asyncio.sleep(2)
+                        await process_signal(session, s); await asyncio.sleep(2)
                     except Exception as e:
                         logger.error(f"process signal err: {e}")
-                # periodic stats (every 4 hours)
                 if time.time() - last_stats > 14400:
-                    await telegram.send_message(session, f"Bot stats: scanned {iteration} cycles")
-                    last_stats = time.time()
+                    await telegram.send_message(session, f"Bot stats: scanned {iteration} cycles"); last_stats = time.time()
                 sleep_time = POLL_INTERVAL if not signals else max(300, POLL_INTERVAL//2)
                 logger.info(f"Sleeping {sleep_time}s until next scan..."); await asyncio.sleep(sleep_time)
             except Exception as e:
