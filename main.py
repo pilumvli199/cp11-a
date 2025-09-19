@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# main.py - Enhanced Crypto Trading Bot v5.0 (1-request-per-second scanning)
+# main.py - Enhanced Crypto Trading Bot v5.0 (1-request-per-second; Option A: no explicit stagger)
 import os, asyncio, aiohttp, traceback, numpy as np, json, logging, time
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -311,7 +311,7 @@ def plot_simple_chart(symbol, candles, signal):
 # ---------------- HTTP SESSION & FETCH WITH GLOBAL BACKOFF ----------------
 @asynccontextmanager
 async def get_session():
-    # small connector limit; we rely on per-second scheduling
+    # small connector limit; we rely on rate_limiter for pacing
     connector = aiohttp.TCPConnector(limit=4, ttl_dns_cache=300, use_dns_cache=True)
     timeout = aiohttp.ClientTimeout(total=30, connect=10)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
@@ -396,7 +396,7 @@ class TelegramNotifier:
 
 telegram = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
-# ---------------- MARKET SCANNER (1 sec per symbol) ----------------
+# ---------------- MARKET SCANNER (Option A: no explicit staggering) ----------------
 class MarketScanner:
     def __init__(self, symbols):
         self.symbols = symbols
@@ -406,10 +406,10 @@ class MarketScanner:
         if recent >= MAX_SIGNALS_PER_HOUR:
             logger.warning(f"Signal rate limit reached {recent}/{MAX_SIGNALS_PER_HOUR} per hour"); return []
         tasks=[]
-        # schedule tasks with 1-second stagger so overall ~N seconds for N symbols
+        # Schedule all tasks immediately (no explicit staggering).
         for symbol in self.symbols:
             tasks.append(asyncio.create_task(self.analyze_symbol(session, symbol)))
-            await asyncio.sleep(1.0)  # 1 request per second pacing
+        # Limit concurrency so we don't blast the network
         sem = asyncio.Semaphore(1)  # only one symbol processed at a time
         async def limited(t):
             async with sem:
@@ -468,7 +468,7 @@ async def process_signal(session, signal):
 async def enhanced_trading_loop():
     scanner = MarketScanner(SYMBOLS)
     async with get_session() as session:
-        startup = (f"🚀 Enhanced Trading Bot v5.0 Started\nSymbols: {len(SYMBOLS)} • Per-second pacing: 1 symbol/sec\nScan interval: {POLL_INTERVAL}s • Conf≥{SIGNAL_CONF_THRESHOLD}%")
+        startup = (f"🚀 Enhanced Trading Bot v5.0 Started\nSymbols: {len(SYMBOLS)} • Per-second pacing via RateLimiter\nScan interval: {POLL_INTERVAL}s • Conf≥{SIGNAL_CONF_THRESHOLD}%")
         logger.info("Trading bot started successfully!"); await telegram.send_message(session, startup)
         iteration = 0; last_stats = time.time()
         while True:
