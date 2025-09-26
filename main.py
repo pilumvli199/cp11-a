@@ -1,7 +1,8 @@
-# ===== patched main.py =====
+# ===== patched main.py (updated to use 1H timeframe and last 720 candles) =====
 #!/usr/bin/env python3
 # main.py - Enhanced Crypto Trading Bot v4.1-patch (EMA9 + EMA20, robust candle parsing)
 # Patched by assistant: replaced non-ASCII characters in function names and improved safety.
+# This version uses 1-hour timeframe and fetches last 720 candles for analysis.
 
 import os
 import re
@@ -35,9 +36,11 @@ SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 80.0))
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
-CANDLE_URL = "https://api.binance.com/api/v3/klines?symbol={symbol}&interval=30m&limit=200"
-CANDLE_URL_1H = "https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1h&limit=200"
+# Use 1-hour timeframe and fetch last 720 candles
+CANDLE_URL = "https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1h&limit=720"
+
+# Minimum candles required for analysis (set to 720 as requested)
+MIN_CANDLES_REQUIRED = 720
 
 # ---------------- Utils ----------------
 
@@ -62,7 +65,6 @@ def ema(values, period):
         v = values[i]
         prev = v * k + prev * (1 - k)
         ema_vals.append(prev)
-    # If input length equals period, ema_vals length equals len(values)
     return ema_vals
 
 # Only EMA 9 and EMA 20 as requested
@@ -151,14 +153,14 @@ def analyze_trade_logic(raw_candles, rr_min=1.5):
         else:
             candles = normalize_klines(raw_candles)
 
-        if len(candles) < 60:
-            return {"side": "none", "confidence": 0, "reason": "insufficient data"}
+        if len(candles) < MIN_CANDLES_REQUIRED:
+            return {"side": "none", "confidence": 0, "reason": f"insufficient data (need {MIN_CANDLES_REQUIRED})"}
 
         closes = [c["close"] for c in candles if c and "close" in c]
         highs = [c["high"] for c in candles if c and "high" in c]
         lows = [c["low"] for c in candles if c and "low" in c]
-        if len(closes) < 60:
-            return {"side": "none", "confidence": 0, "reason": "insufficient valid closes"}
+        if len(closes) < MIN_CANDLES_REQUIRED:
+            return {"side": "none", "confidence": 0, "reason": f"insufficient valid closes (need {MIN_CANDLES_REQUIRED})"}
 
         current_price = closes[-1]
 
@@ -258,20 +260,6 @@ def analyze_trade_logic(raw_candles, rr_min=1.5):
         traceback.print_exc()
         return {"side": "none", "confidence": 0, "reason": f"internal error: {e}"}
 
-
-def multi_tf_confirmation(c30, c1h):
-    """Accepts raw klines for 30m and 1h"""
-    s30 = analyze_trade_logic(c30)
-    s1h = analyze_trade_logic(c1h)
-    if s30.get("side") == "none" or s1h.get("side") == "none":
-        return {"side": "none", "confidence": 0, "reason": "no alignment"}
-    if s30["side"] == s1h["side"]:
-        combined_conf = min(100, int((s30.get("confidence",0) + s1h.get("confidence",0))/2) + 15)
-        s30["confidence"] = combined_conf
-        s30["reason"] = s30.get("reason", "") + f"; 1H aligned (trend: {s1h.get('trend_score',0)})"
-        return s30
-    return {"side": "none", "confidence": 0, "reason": "timeframe conflict"}
-
 # ---------------- Charting ----------------
 def plot_signal_chart(symbol, raw_candles, signal):
     candles = normalize_klines(raw_candles)
@@ -325,7 +313,7 @@ def plot_signal_chart(symbol, raw_candles, signal):
 # ---------------- Fetch ----------------
 async def fetch_json(session, url):
     try:
-        async with session.get(url, timeout=20) as r:
+        async with session.get(url, timeout=60) as r:
             if r.status != 200:
                 # return None but print quick info for debugging
                 text = await r.text()
@@ -409,7 +397,7 @@ async def send_photo(session, caption, path):
 # ---------------- Main Enhanced Loop ----------------
 async def enhanced_loop():
     async with aiohttp.ClientSession() as session:
-        startup = f"🤖 Enhanced Bot Started! • {len(SYMBOLS)} symbols • EMAs: 9 & 20 • Poll: {POLL_INTERVAL}s"
+        startup = f"🤖 Enhanced Bot Started! • {len(SYMBOLS)} symbols • TF: 1H • Candles: {MIN_CANDLES_REQUIRED} • Poll: {POLL_INTERVAL}s"
         print(startup)
         await send_text(session, startup)
 
@@ -426,22 +414,20 @@ async def enhanced_loop():
                 try:
                     print(f"\n📊 Analyzing {sym}...")
 
-                    # Fetch candle data (raw binance klines)
-                    c30 = await fetch_json(session, CANDLE_URL.format(symbol=sym))
-                    c1h = await fetch_json(session, CANDLE_URL_1H.format(symbol=sym))
+                    # Fetch 1H candle data (raw binance klines), last 720 candles
+                    c1h = await fetch_json(session, CANDLE_URL.format(symbol=sym))
 
-                    if not c30 or not c1h:
-                        print(f"❌ Failed to fetch data for {sym} (30m:{bool(c30)} 1h:{bool(c1h)})")
+                    if not c1h:
+                        print(f"❌ Failed to fetch data for {sym} (1h:{bool(c1h)})")
                         continue
 
                     # Use raw klines directly (normalize inside analysis)
-                    local_signal = multi_tf_confirmation(c30, c1h)
+                    local_signal = analyze_trade_logic(c1h)
 
                     if local_signal.get("side") != "none" and local_signal.get("confidence", 0) >= SIGNAL_CONF_THRESHOLD:
                         # Compute EMAs from closes for AI & chart
-                        # normalize and extract closes safely
-                        normalized_30 = normalize_klines(c30)
-                        closes = [c["close"] for c in normalized_30]
+                        normalized = normalize_klines(c1h)
+                        closes = [c["close"] for c in normalized]
                         emas = calculate_emas_9_20(closes)
 
                         # Ask AI for confirmation
@@ -466,7 +452,7 @@ async def enhanced_loop():
                                    f"⚖️ Risk/Reward: 1:{local_signal.get('rr',0)}\n"
                                    f"💡 Reason: {local_signal.get('reason','')[:140]}")
 
-                            chart_path = plot_signal_chart(sym, c30, local_signal)
+                            chart_path = plot_signal_chart(sym, c1h, local_signal)
                             await send_photo(session, msg, chart_path)
                             print(f"⚡ SIGNAL SENT: {sym} {local_signal['side']} | Conf: {final_confidence}%")
                         else:
