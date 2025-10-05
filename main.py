@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# main.py - Enhanced Crypto Trading Bot v5.0 - Price Action Master Edition
-# Major improvements: Advanced candlestick patterns, chart patterns, trendlines, S/R zones
-# Pure price action + EMA9/EMA20 confluence for highest accuracy
+# main.py - Enhanced Crypto Trading Bot v5.1 FINAL - Complete Integration
+# All improvements: Enhanced scoring, adaptive R/R, detailed debug logs, AI validation
 
 import os
 import re
@@ -17,7 +16,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.dates import date2num
-from matplotlib.patches import Rectangle
 from tempfile import NamedTemporaryFile
 
 load_dotenv()
@@ -32,7 +30,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 75.0))
+SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 70.0))
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
@@ -102,8 +100,6 @@ def detect_candlestick_patterns(candles):
         range2 = h2 - l2
         
         # Bullish Patterns
-        
-        # Hammer / Inverted Hammer
         if body2 > 0.001:
             lower_shadow = min(o2, cl2) - l2
             upper_shadow = h2 - max(o2, cl2)
@@ -112,20 +108,16 @@ def detect_candlestick_patterns(candles):
             elif upper_shadow > body2 * 2 and lower_shadow < body2 * 0.3 and cl2 > o2:
                 patterns.append({"type": "Inverted Hammer", "sentiment": "bullish", "strength": 7, "index": i})
         
-        # Bullish Engulfing
         if cl0 < o0 and cl2 > o2 and cl2 >= o0 and o2 <= cl0:
             patterns.append({"type": "Bullish Engulfing", "sentiment": "bullish", "strength": 9, "index": i})
         
-        # Morning Star
         if len(candles) >= i+1:
             if cl0 < o0 and body1 < body2 * 0.3 and cl2 > o2 and cl2 > (o0 + cl0)/2:
                 patterns.append({"type": "Morning Star", "sentiment": "bullish", "strength": 10, "index": i})
         
-        # Piercing Pattern
         if cl0 < o0 and cl2 > o2 and o2 < cl0 and cl2 > (o0 + cl0)/2 and cl2 < o0:
             patterns.append({"type": "Piercing Pattern", "sentiment": "bullish", "strength": 8, "index": i})
         
-        # Three White Soldiers
         if i >= 3:
             c3 = candles[i-3]
             if (cl2 > o2 and cl1 > o1 and c3['close'] > c3['open'] and
@@ -133,8 +125,6 @@ def detect_candlestick_patterns(candles):
                 patterns.append({"type": "Three White Soldiers", "sentiment": "bullish", "strength": 10, "index": i})
         
         # Bearish Patterns
-        
-        # Shooting Star / Hanging Man
         if body2 > 0.001:
             lower_shadow = min(o2, cl2) - l2
             upper_shadow = h2 - max(o2, cl2)
@@ -143,26 +133,21 @@ def detect_candlestick_patterns(candles):
             elif lower_shadow > body2 * 2 and upper_shadow < body2 * 0.3 and cl2 < o2:
                 patterns.append({"type": "Hanging Man", "sentiment": "bearish", "strength": 7, "index": i})
         
-        # Bearish Engulfing
         if cl0 > o0 and cl2 < o2 and cl2 <= o0 and o2 >= cl0:
             patterns.append({"type": "Bearish Engulfing", "sentiment": "bearish", "strength": 9, "index": i})
         
-        # Evening Star
         if cl0 > o0 and body1 < body2 * 0.3 and cl2 < o2 and cl2 < (o0 + cl0)/2:
             patterns.append({"type": "Evening Star", "sentiment": "bearish", "strength": 10, "index": i})
         
-        # Dark Cloud Cover
         if cl0 > o0 and cl2 < o2 and o2 > cl0 and cl2 < (o0 + cl0)/2 and cl2 > o0:
             patterns.append({"type": "Dark Cloud Cover", "sentiment": "bearish", "strength": 8, "index": i})
         
-        # Three Black Crows
         if i >= 3:
             c3 = candles[i-3]
             if (cl2 < o2 and cl1 < o1 and c3['close'] < c3['open'] and
                 cl2 < cl1 < c3['close'] and body2 > 0 and body1 > 0):
                 patterns.append({"type": "Three Black Crows", "sentiment": "bearish", "strength": 10, "index": i})
         
-        # Doji variations
         if body2 < range2 * 0.1 and range2 > 0:
             patterns.append({"type": "Doji", "sentiment": "neutral", "strength": 5, "index": i})
     
@@ -178,9 +163,7 @@ def detect_chart_patterns(highs, lows, closes, lookback=50):
     
     recent_highs = highs[-n:]
     recent_lows = lows[-n:]
-    recent_closes = closes[-n:]
     
-    # Find significant swing points
     swing_highs = []
     swing_lows = []
     
@@ -190,7 +173,6 @@ def detect_chart_patterns(highs, lows, closes, lookback=50):
         if recent_lows[i] == min(recent_lows[i-5:i+5]):
             swing_lows.append((i, recent_lows[i]))
     
-    # Double Top/Bottom detection
     if len(swing_highs) >= 2:
         last_two_highs = swing_highs[-2:]
         if abs(last_two_highs[0][1] - last_two_highs[1][1]) / last_two_highs[0][1] < 0.02:
@@ -201,7 +183,6 @@ def detect_chart_patterns(highs, lows, closes, lookback=50):
         if abs(last_two_lows[0][1] - last_two_lows[1][1]) / last_two_lows[0][1] < 0.02:
             patterns.append({"type": "Double Bottom", "sentiment": "bullish", "strength": 8})
     
-    # Triangle patterns (simplified)
     if len(swing_highs) >= 3 and len(swing_lows) >= 3:
         high_trend = (swing_highs[-1][1] - swing_highs[-3][1]) / swing_highs[-3][1]
         low_trend = (swing_lows[-1][1] - swing_lows[-3][1]) / swing_lows[-3][1]
@@ -213,7 +194,6 @@ def detect_chart_patterns(highs, lows, closes, lookback=50):
         elif abs(high_trend) < 0.015 and abs(low_trend) < 0.015:
             patterns.append({"type": "Symmetrical Triangle", "sentiment": "neutral", "strength": 6})
     
-    # Head and Shoulders (simplified detection)
     if len(swing_highs) >= 3:
         h = swing_highs[-3:]
         if h[1][1] > h[0][1] and h[1][1] > h[2][1] and abs(h[0][1] - h[2][1]) / h[0][1] < 0.03:
@@ -228,7 +208,7 @@ def calculate_sr_zones(closes, highs, lows, lookback=100):
     prices = list(closes[-n:]) + list(highs[-n:]) + list(lows[-n:])
     
     zones = []
-    tolerance = 0.003  # 0.3% clustering
+    tolerance = 0.003
     
     for p in prices:
         if p is None or p == 0:
@@ -243,7 +223,6 @@ def calculate_sr_zones(closes, highs, lows, lookback=100):
         if not found:
             zones.append({'price': p, 'touches': 1})
     
-    # Sort by touches and get top zones
     zones.sort(key=lambda x: -x['touches'])
     current = closes[-1]
     
@@ -268,15 +247,9 @@ def detect_trendlines(highs, lows, closes, lookback=100):
     recent_highs = np.array(highs[-n:])
     recent_lows = np.array(lows[-n:])
     
-    # Fit linear regression for support (lows) and resistance (highs)
     try:
-        # Support trendline
         support_slope, support_intercept = np.polyfit(indices, recent_lows, 1)
-        support_line = support_slope * indices + support_intercept
-        
-        # Resistance trendline
         resistance_slope, resistance_intercept = np.polyfit(indices, recent_highs, 1)
-        resistance_line = resistance_slope * indices + resistance_intercept
         
         return {
             'support_line': (support_slope, support_intercept),
@@ -288,8 +261,8 @@ def detect_trendlines(highs, lows, closes, lookback=100):
         return {'support_line': None, 'resistance_line': None}
 
 # ---------------- ENHANCED TRADE ANALYSIS ----------------
-def analyze_trade_logic(raw_candles, rr_min=1.8):
-    """Enhanced trade analysis with price action, patterns, S/R, trendlines"""
+def analyze_trade_logic(raw_candles):
+    """Enhanced trade analysis with improved scoring and adaptive R/R"""
     try:
         if not raw_candles:
             return {"side": "none", "confidence": 0, "reason": "no data"}
@@ -318,73 +291,99 @@ def analyze_trade_logic(raw_candles, rr_min=1.8):
         sr_zones = calculate_sr_zones(closes, highs, lows, lookback=100)
         trendlines = detect_trendlines(highs, lows, closes, lookback=100)
         
-        # Score calculation
+        # Enhanced Score calculation
         score = 0
         reasons = []
         detected_patterns = []
         
-        # EMA signals
-        if current_price > ema9:
-            score += 2
+        # EMA signals (stronger weighting)
+        price_above_ema9 = current_price > ema9
+        ema_bullish = ema9 > ema20
+        
+        if price_above_ema9:
+            score += 2.5
             reasons.append("Price > EMA9")
         else:
-            score -= 1
+            score -= 1.5
         
-        if ema9 > ema20:
-            score += 3
+        if ema_bullish:
+            score += 3.5
             reasons.append("EMA9 > EMA20 (bullish)")
         else:
-            score -= 3
+            score -= 3.5
             reasons.append("EMA9 < EMA20 (bearish)")
         
-        # Candlestick pattern scoring
+        # Price position confluence bonus
+        if price_above_ema9 and ema_bullish and current_price > ema20:
+            score += 1.5
+            reasons.append("Full EMA alignment")
+        elif not price_above_ema9 and not ema_bullish and current_price < ema20:
+            score -= 1.5
+            reasons.append("Full bearish EMA")
+        
+        # Candlestick pattern scoring (improved weighting)
         bullish_patterns = [p for p in candle_patterns if p['sentiment'] == 'bullish']
         bearish_patterns = [p for p in candle_patterns if p['sentiment'] == 'bearish']
         
-        for p in bullish_patterns[-3:]:
-            score += p['strength'] / 2
+        for i, p in enumerate(bullish_patterns[-3:]):
+            weight = 0.7 if i == len(bullish_patterns[-3:]) - 1 else 0.5
+            score += p['strength'] * weight
             detected_patterns.append(p['type'])
         
-        for p in bearish_patterns[-3:]:
-            score -= p['strength'] / 2
+        for i, p in enumerate(bearish_patterns[-3:]):
+            weight = 0.7 if i == len(bearish_patterns[-3:]) - 1 else 0.5
+            score -= p['strength'] * weight
             detected_patterns.append(p['type'])
         
         # Chart pattern scoring
         for p in chart_patterns:
             if p['sentiment'] == 'bullish':
-                score += p['strength'] / 2
+                score += p['strength'] * 0.65
                 detected_patterns.append(p['type'])
             elif p['sentiment'] == 'bearish':
-                score -= p['strength'] / 2
+                score -= p['strength'] * 0.65
                 detected_patterns.append(p['type'])
         
-        # Support/Resistance proximity
+        # Support/Resistance proximity (stronger bonus)
         supports = sr_zones['support']
         resistances = sr_zones['resistance']
+        support_strength = sr_zones.get('support_strength', [])
+        resistance_strength = sr_zones.get('resistance_strength', [])
         
-        near_support = any(abs(current_price - s) / current_price < 0.01 for s in supports[:2]) if supports else False
-        near_resistance = any(abs(current_price - r) / current_price < 0.01 for r in resistances[:2]) if resistances else False
+        near_support = any(abs(current_price - s) / current_price < 0.015 for s in supports[:2]) if supports else False
+        near_resistance = any(abs(current_price - r) / current_price < 0.015 for r in resistances[:2]) if resistances else False
         
         if near_support and score > 0:
-            score += 3
+            strength_bonus = support_strength[0] * 0.3 if support_strength else 1
+            score += 3.5 + strength_bonus
             reasons.append("Near strong support")
         if near_resistance and score < 0:
-            score += 3
+            strength_bonus = resistance_strength[0] * 0.3 if resistance_strength else 1
+            score += 3.5 + strength_bonus
             reasons.append("Near strong resistance")
         
         # Trendline alignment
         if trendlines.get('support_trend') == 'bullish' and score > 0:
-            score += 2
+            score += 2.5
             reasons.append("Bullish trendline")
         if trendlines.get('resistance_trend') == 'bearish' and score < 0:
-            score += 2
+            score += 2.5
             reasons.append("Bearish trendline")
         
-        # Base confidence
-        base_conf = 50 + abs(score) * 3
+        # Multiple pattern confluence
+        if len(detected_patterns) >= 2:
+            if score > 0 and len(bullish_patterns) >= 2:
+                score += 1.5
+                reasons.append("Multiple bullish patterns")
+            elif score < 0 and len(bearish_patterns) >= 2:
+                score += 1.5
+                reasons.append("Multiple bearish patterns")
         
-        # Generate signals
-        if score >= 5:  # Strong bullish
+        # Base confidence (capped properly)
+        base_conf = min(90, 55 + abs(score) * 3.5)
+        
+        # Generate signals (simplified and aggressive)
+        if score >= 4.5:  # Bullish
             support = supports[0] if supports else current_price * 0.98
             resistance = resistances[0] if resistances else current_price * 1.05
             
@@ -392,10 +391,31 @@ def analyze_trade_logic(raw_candles, rr_min=1.8):
             sl = float(support) * 0.996
             tp = float(resistance)
             
-            if (entry - sl) > 0:
-                rr = (tp - entry) / (entry - sl)
-                if rr >= rr_min:
-                    confidence = min(95, int(base_conf))
+            risk = entry - sl
+            reward = tp - entry
+            
+            print(f"  💡 BUY Setup: Score={score:.2f}, Entry={entry:.4f}, SL={sl:.4f}, TP={tp:.4f}")
+            print(f"     Risk={risk:.6f}, Reward={reward:.6f}")
+            
+            if risk > 0 and reward > 0:
+                rr = reward / risk
+                print(f"     R/R={rr:.2f}, BaseConf={base_conf:.0f}%")
+                
+                # Adaptive R/R based on confidence
+                if base_conf >= 85:
+                    rr_threshold = 1.2
+                elif base_conf >= 75:
+                    rr_threshold = 1.4
+                elif base_conf >= 70:
+                    rr_threshold = 1.6
+                else:
+                    rr_threshold = 1.8
+                
+                print(f"     Required R/R: {rr_threshold}")
+                
+                if rr >= rr_threshold:
+                    confidence = min(90, int(base_conf))
+                    print(f"  ✅ BUY SIGNAL GENERATED! Confidence={confidence}%")
                     return {
                         "side": "BUY",
                         "entry": entry,
@@ -410,8 +430,12 @@ def analyze_trade_logic(raw_candles, rr_min=1.8):
                         "sr_zones": sr_zones,
                         "trendlines": trendlines
                     }
+                else:
+                    print(f"  ⚠️ BUY rejected: R/R {rr:.2f} < {rr_threshold}")
+            else:
+                print(f"  ⚠️ BUY rejected: Invalid risk/reward (risk={risk:.6f}, reward={reward:.6f})")
         
-        elif score <= -5:  # Strong bearish
+        elif score <= -4.5:  # Bearish
             support = supports[0] if supports else current_price * 0.95
             resistance = resistances[0] if resistances else current_price * 1.02
             
@@ -419,10 +443,30 @@ def analyze_trade_logic(raw_candles, rr_min=1.8):
             sl = float(resistance) * 1.004
             tp = float(support)
             
-            if (sl - entry) > 0:
-                rr = (entry - tp) / (sl - entry)
-                if rr >= rr_min:
-                    confidence = min(95, int(base_conf))
+            risk = sl - entry
+            reward = entry - tp
+            
+            print(f"  💡 SELL Setup: Score={score:.2f}, Entry={entry:.4f}, SL={sl:.4f}, TP={tp:.4f}")
+            print(f"     Risk={risk:.6f}, Reward={reward:.6f}")
+            
+            if risk > 0 and reward > 0:
+                rr = reward / risk
+                print(f"     R/R={rr:.2f}, BaseConf={base_conf:.0f}%")
+                
+                if base_conf >= 85:
+                    rr_threshold = 1.2
+                elif base_conf >= 75:
+                    rr_threshold = 1.4
+                elif base_conf >= 70:
+                    rr_threshold = 1.6
+                else:
+                    rr_threshold = 1.8
+                
+                print(f"     Required R/R: {rr_threshold}")
+                
+                if rr >= rr_threshold:
+                    confidence = min(90, int(base_conf))
+                    print(f"  ✅ SELL SIGNAL GENERATED! Confidence={confidence}%")
                     return {
                         "side": "SELL",
                         "entry": entry,
@@ -437,10 +481,16 @@ def analyze_trade_logic(raw_candles, rr_min=1.8):
                         "sr_zones": sr_zones,
                         "trendlines": trendlines
                     }
+                else:
+                    print(f"  ⚠️ SELL rejected: R/R {rr:.2f} < {rr_threshold}")
+            else:
+                print(f"  ⚠️ SELL rejected: Invalid risk/reward (risk={risk:.6f}, reward={reward:.6f})")
+        else:
+            print(f"  📊 Score {score:.2f} not strong enough (need >=4.5 or <=-4.5)")
         
         return {
             "side": "none",
-            "confidence": int(base_conf),
+            "confidence": min(90, int(base_conf)),
             "reason": "; ".join(reasons[:3]) if reasons else "no clear setup",
             "score": round(score, 2),
             "patterns": detected_patterns[:3],
@@ -454,7 +504,7 @@ def analyze_trade_logic(raw_candles, rr_min=1.8):
 
 # ---------------- ENHANCED CHART ----------------
 def plot_signal_chart(symbol, raw_candles, signal):
-    """Enhanced chart with patterns, S/R zones, trendlines"""
+    """Enhanced chart with professional styling"""
     candles = normalize_klines(raw_candles)
     if not candles or len(candles) < 50:
         tmp = NamedTemporaryFile(delete=False, suffix=".png")
@@ -465,7 +515,6 @@ def plot_signal_chart(symbol, raw_candles, signal):
         plt.close()
         return tmp.name
     
-    # Prepare data
     dates = [datetime.utcfromtimestamp(c['ts']/1000) for c in candles]
     closes = [c['close'] for c in candles]
     opens = [c['open'] for c in candles]
@@ -474,7 +523,6 @@ def plot_signal_chart(symbol, raw_candles, signal):
     
     x = date2num(dates)
     
-    # Create figure
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 10), gridspec_kw={'height_ratios': [4, 1]})
     fig.patch.set_facecolor('#0a0e27')
     ax1.set_facecolor('#0f1419')
@@ -519,7 +567,8 @@ def plot_signal_chart(symbol, raw_candles, signal):
         ax1.plot(x, tl, color='#66bb6a', linestyle=':', linewidth=2, alpha=0.6, label='Support Trendline')
     
     if trendlines.get('resistance_line'):
-        slope, intercept = trendlines['resistance_line']
+        slope, intercept = t
+        rendlines['resistance_line']
         tl = slope * np.arange(len(x)) + intercept
         ax1.plot(x, tl, color='#ef5350', linestyle=':', linewidth=2, alpha=0.6, label='Resistance Trendline')
     
@@ -531,7 +580,6 @@ def plot_signal_chart(symbol, raw_candles, signal):
     if signal.get('tp'):
         ax1.axhline(signal['tp'], color='#69f0ae', linestyle='-', linewidth=2, label=f"Take Profit {fmt_price(signal['tp'])}")
     
-    # Styling
     ax1.set_title(f'{symbol} - Price Action Analysis', color='white', fontsize=16, fontweight='bold', pad=20)
     ax1.legend(loc='upper left', fontsize=9, framealpha=0.9, facecolor='#1a1f2e', edgecolor='#2a2f3e')
     ax1.grid(True, alpha=0.15, color='#2a2f3e')
@@ -553,7 +601,7 @@ def plot_signal_chart(symbol, raw_candles, signal):
 
 # ---------------- ENHANCED AI ANALYSIS ----------------
 async def ask_openai_for_signals(symbol, signal_data):
-    """Enhanced AI analysis with pattern recognition"""
+    """Enhanced AI analysis with GPT-4o-mini"""
     if not client:
         return None
     
@@ -582,7 +630,7 @@ async def ask_openai_for_signals(symbol, signal_data):
     )
     
     user_prompt = f"""Market Analysis for {symbol}:
-    
+
 Price: {market_summary['current_price']}
 Technical Score: {market_summary['score']}
 EMA 9: {market_summary['ema_9']}
@@ -668,23 +716,25 @@ async def send_photo(session, caption, path):
         except:
             pass
 
-# ---------------- MAIN ENHANCED LOOP ----------------
+# ---------------- MAIN LOOP ----------------
 async def enhanced_loop():
     async with aiohttp.ClientSession() as session:
         startup = (
-            f"🚀 <b>Price Action Master Bot v5.0 Started!</b>\n\n"
+            f"🚀 <b>Price Action Master Bot v5.1 FINAL Started!</b>\n\n"
             f"📊 Symbols: {len(SYMBOLS)}\n"
             f"⏱ Timeframe: 1H\n"
             f"📈 Candles: {MIN_CANDLES_REQUIRED}\n"
             f"🔄 Poll Interval: {POLL_INTERVAL}s\n"
             f"🎯 Min Confidence: {int(SIGNAL_CONF_THRESHOLD)}%\n\n"
             f"✨ Features:\n"
-            f"• EMA 9 & 20\n"
+            f"• EMA 9 & 20 (Enhanced Weighting)\n"
             f"• 15+ Candlestick Patterns\n"
-            f"• Chart Patterns (H&S, Triangles, Double Top/Bottom)\n"
+            f"• Chart Patterns Detection\n"
             f"• Dynamic S/R Zones\n"
             f"• Trendline Detection\n"
-            f"• AI-Enhanced Validation"
+            f"• Adaptive Risk/Reward (1.2-1.8)\n"
+            f"• AI Validation (GPT-4o-mini)\n"
+            f"• Debug Logging Enabled"
         )
         print(startup)
         await send_text(session, startup)
@@ -703,14 +753,12 @@ async def enhanced_loop():
                 try:
                     print(f"\n📊 Analyzing {sym}...")
 
-                    # Fetch candle data
                     candles_raw = await fetch_json(session, CANDLE_URL.format(symbol=sym))
 
                     if not candles_raw:
                         print(f"❌ Failed to fetch data for {sym}")
                         continue
 
-                    # Analyze with price action
                     local_signal = analyze_trade_logic(candles_raw)
 
                     analysis_summary.append({
@@ -721,7 +769,7 @@ async def enhanced_loop():
                     })
 
                     if local_signal.get("side") != "none" and local_signal.get("confidence", 0) >= SIGNAL_CONF_THRESHOLD:
-                        # Ask AI for validation
+                        # AI validation
                         ai_response = await ask_openai_for_signals(sym, local_signal)
                         
                         ai_boost = 0
@@ -737,7 +785,6 @@ async def enhanced_loop():
                                 ai_verdict = "❌ REJECTED"
                                 print(f"❌ AI rejected signal for {sym}")
                             
-                            # Extract AI confidence if present
                             conf_match = re.search(r'CONFIDENCE:\s*(\d+)', ai_response)
                             if conf_match:
                                 ai_conf = int(conf_match.group(1))
@@ -775,20 +822,19 @@ async def enhanced_loop():
                     else:
                         reason = local_signal.get('reason', 'no setup')
                         conf = local_signal.get('confidence', 0)
+                        score_val = local_signal.get('score', 0)
                         patterns = ", ".join(local_signal.get('patterns', [])[:2]) or "none"
-                        print(f"📊 {sym}: No signal (Conf: {conf}%, Patterns: {patterns}, Reason: {reason[:50]})")
+                        print(f"📊 {sym}: No signal (Score: {score_val:.1f}, Conf: {conf}%, Patterns: {patterns}, Reason: {reason[:50]})")
 
                 except Exception as e:
                     print(f"❌ Error analyzing {sym}: {e}")
                     traceback.print_exc()
 
-            # Summary message
             print(f"\n{'='*70}")
             print(f"📊 Iteration {iteration} complete: {signals_found} signals found")
             print(f"{'='*70}")
             
             if signals_found == 0:
-                # Create detailed summary
                 top_by_conf = sorted(analysis_summary, key=lambda x: x['confidence'], reverse=True)[:5]
                 
                 summary_lines = [f"<b>📊 Scan #{iteration} Complete</b>\n"]
