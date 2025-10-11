@@ -1,46 +1,46 @@
-# ===== patched main.py (updated to use 1H timeframe and last 720 candles) =====
 #!/usr/bin/env python3
-# main.py - Enhanced Crypto Trading Bot v4.1-patch (EMA9 + EMA20, robust candle parsing)
-# Patched by assistant: replaced non-ASCII characters in function names and improved safety.
-# This version uses 1-hour timeframe and fetches last 720 candles for analysis.
+# main.py - Qwen 2.5 VL 72B Crypto Trading Bot (OpenRouter)
+# Charts analysis every 1 hour with rate limit handling (10 sec per scan)
 
 import os
-import re
 import asyncio
 import aiohttp
 import traceback
-import numpy as np
+import base64
 import json
 from datetime import datetime
 from dotenv import load_dotenv
-from openai import OpenAI
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.dates import date2num
 from tempfile import NamedTemporaryFile
+import io
+from PIL import Image
 
 load_dotenv()
 
 # ---------------- CONFIG ----------------
 SYMBOLS = [
-    "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","AAVEUSDT",
-    "TRXUSDT","DOGEUSDT","BNBUSDT","ADAUSDT","LTCUSDT","LINKUSDT"
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "AAVEUSDT",
+    "TRXUSDT", "DOGEUSDT", "BNBUSDT", "ADAUSDT", "LTCUSDT"
 ]
-POLL_INTERVAL = max(30, int(os.getenv("POLL_INTERVAL", 1800)))
+
+POLL_INTERVAL = 3600  # 1 hour = 3600 seconds
+SCAN_DELAY = 10  # 10 seconds delay between each coin scan (rate limit safety)
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 80.0))
 
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# OpenRouter API Configuration
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen-2-vl-72b-instruct:free")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Use 1-hour timeframe and fetch last 720 candles
-CANDLE_URL = "https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1h&limit=720"
+SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 70.0))
 
-# Minimum candles required for analysis (set to 720 as requested)
-MIN_CANDLES_REQUIRED = 720
+# Binance API - 1H timeframe, last 100 candles (enough for analysis)
+CANDLE_URL = "https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1h&limit=100"
 
 # ---------------- Utils ----------------
 
@@ -51,432 +51,521 @@ def fmt_price(p):
         return str(p)
     return f"{p:.6f}" if abs(p) < 1 else f"{p:.2f}"
 
-# Robust EMA (returns list aligned with input length; initial (period-1) entries are None)
-def ema(values, period):
-    if not values or len(values) < period:
-        return []
-    k = 2.0 / (period + 1)
-    ema_vals = [None] * (period - 1)
-    # SMA for first EMA value
-    sma = sum(values[:period]) / period
-    ema_vals.append(sma)
-    prev = sma
-    for i in range(period, len(values)):
-        v = values[i]
-        prev = v * k + prev * (1 - k)
-        ema_vals.append(prev)
-    return ema_vals
+# ---------------- Chart Generation ----------------
 
-# Only EMA 9 and EMA 20 as requested
-def calculate_emas_9_20(closes):
+def generate_chart_image(symbol, candles):
     """
-    returns dict with keys 'ema_9' and 'ema_20' values aligned to last candle (or None)
+    Generate candlestick chart from Binance candle data
+    Returns: bytes of PNG image
     """
-    out = {}
     try:
-        e9 = ema(closes, 9)
-        e20 = ema(closes, 20)
-        out['ema_9'] = e9[-1] if e9 else None
-        out['ema_20'] = e20[-1] if e20 else None
-    except Exception:
-        out['ema_9'] = None
-        out['ema_20'] = None
-    return out
+        if not candles or len(candles) < 20:
+            # Fallback: simple text image
+            fig = plt.figure(figsize=(12, 6))
+            plt.text(0.5, 0.5, f"{symbol}\nInsufficient Data", 
+                    ha='center', va='center', fontsize=20)
+            plt.axis('off')
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+            plt.close(fig)
+            buf.seek(0)
+            return buf.getvalue()
 
-# normalize raw kline rows into dicts: [o,h,l,close,volume,ts]
-def normalize_klines(raw_klines):
-    """
-    Accepts list of kline rows (binance raw) where each row is list-like.
-    Outputs list of dicts: {"open":float,"high":float,"low":float,"close":float,"volume":float,"ts":int}
-    Skips malformed rows gracefully.
-    """
-    out = []
-    for row in raw_klines or []:
-        try:
-            # Binance kline: [openTime, open, high, low, close, volume, ...]
-            if len(row) >= 6:
-                ts = int(row[0]) if isinstance(row[0], (int, float, str)) else None
-                o = float(row[1]); h = float(row[2]); l = float(row[3]); c = float(row[4]); v = float(row[5])
-                out.append({"open": o, "high": h, "low": l, "close": c, "volume": v, "ts": ts})
-            else:
-                # maybe a shorter processed candle like [o,h,l,close]
-                if len(row) >= 4:
-                    o = float(row[0]); h = float(row[1]); l = float(row[2]); c = float(row[3])
-                    out.append({"open": o, "high": h, "low": l, "close": c, "volume": 0.0, "ts": None})
-                else:
-                    # skip
-                    continue
-        except Exception:
-            # skip malformed row
-            continue
-    return out
+        # Parse candle data
+        times = []
+        opens = []
+        highs = []
+        lows = []
+        closes = []
+        volumes = []
 
-# Enhanced horizontal levels (safe handling)
-def horizontal_levels(closes, highs, lows, lookback=50, binsize=0.002):
-    try:
-        length = min(len(closes), lookback)
-        pts = closes[-length:] + highs[-length:] + lows[-length:]
-    except Exception:
-        return []
-    levels = []
-    for p in pts:
-        if p is None or p == 0:
-            continue
-        found = False
-        for lv in levels:
+        for candle in candles:
             try:
-                if abs((lv["price"] - p) / p) < binsize:
-                    lv["count"] += 1
-                    lv["price"] = (lv["price"] * (lv["count"] - 1) + p) / lv["count"]
-                    found = True
-                    break
+                timestamp = int(candle[0])
+                times.append(datetime.utcfromtimestamp(timestamp / 1000))
+                opens.append(float(candle[1]))
+                highs.append(float(candle[2]))
+                lows.append(float(candle[3]))
+                closes.append(float(candle[4]))
+                volumes.append(float(candle[5]))
             except Exception:
                 continue
-        if not found:
-            levels.append({"price": p, "count": 1})
-    levels.sort(key=lambda x: -x["count"])
-    return [lv["price"] for lv in levels][:5]
 
-# ---------------- Trade logic (robust, uses normalized candles) ----------------
-def analyze_trade_logic(raw_candles, rr_min=1.5):
-    """
-    raw_candles: list of raw kline rows OR normalized candle dicts
-    returns trade dict or 'none'
-    """
-    try:
-        # Normalize if needed
-        if not raw_candles:
-            return {"side": "none", "confidence": 0, "reason": "no candles"}
-        # If already normalized (dicts with 'close'), keep; else normalize
-        if isinstance(raw_candles[0], dict) and 'close' in raw_candles[0]:
-            candles = raw_candles
-        else:
-            candles = normalize_klines(raw_candles)
+        if len(closes) < 20:
+            raise Exception("Not enough valid candles")
 
-        if len(candles) < MIN_CANDLES_REQUIRED:
-            return {"side": "none", "confidence": 0, "reason": f"insufficient data (need {MIN_CANDLES_REQUIRED})"}
+        # Create figure with 2 subplots
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), 
+                                        gridspec_kw={'height_ratios': [3, 1]})
+        
+        # Plot candlesticks
+        x = date2num(times)
+        for i in range(len(x)):
+            color = 'green' if closes[i] >= opens[i] else 'red'
+            # High-low line
+            ax1.plot([x[i], x[i]], [lows[i], highs[i]], 
+                    color=color, linewidth=1.0, alpha=0.8)
+            # Open-close body
+            ax1.plot([x[i], x[i]], [opens[i], closes[i]], 
+                    color=color, linewidth=4.0, solid_capstyle='round')
 
-        closes = [c["close"] for c in candles if c and "close" in c]
-        highs = [c["high"] for c in candles if c and "high" in c]
-        lows = [c["low"] for c in candles if c and "low" in c]
-        if len(closes) < MIN_CANDLES_REQUIRED:
-            return {"side": "none", "confidence": 0, "reason": f"insufficient valid closes (need {MIN_CANDLES_REQUIRED})"}
+        # Calculate and plot simple moving averages
+        def sma(data, period):
+            result = []
+            for i in range(len(data)):
+                if i < period - 1:
+                    result.append(None)
+                else:
+                    result.append(sum(data[i-period+1:i+1]) / period)
+            return result
 
-        current_price = closes[-1]
+        sma20 = sma(closes, 20)
+        sma50 = sma(closes, 50)
 
-        # EMAs (only 9 & 20)
-        emas = calculate_emas_9_20(closes)
-        ema9 = emas.get('ema_9')
-        ema20 = emas.get('ema_20')
+        # Plot SMAs
+        valid_sma20 = [(x[i], sma20[i]) for i in range(len(sma20)) if sma20[i] is not None]
+        valid_sma50 = [(x[i], sma50[i]) for i in range(len(sma50)) if sma50[i] is not None]
+        
+        if valid_sma20:
+            ax1.plot([v[0] for v in valid_sma20], [v[1] for v in valid_sma20], 
+                    label='SMA20', linewidth=1.5, color='blue', alpha=0.7)
+        if valid_sma50:
+            ax1.plot([v[0] for v in valid_sma50], [v[1] for v in valid_sma50], 
+                    label='SMA50', linewidth=1.5, color='orange', alpha=0.7)
 
-        # Basic safety checks
-        if ema9 is None or ema20 is None:
-            return {"side": "none", "confidence": 0, "reason": "ema values missing"}
+        ax1.set_title(f"{symbol} - 1H Chart", fontsize=14, fontweight='bold')
+        ax1.set_ylabel('Price (USDT)', fontsize=10)
+        ax1.legend(loc='upper left', fontsize=9)
+        ax1.grid(True, alpha=0.3, linestyle='--')
+        ax1.tick_params(axis='x', rotation=45)
 
-        # Trend scoring using EMA 9 & 20
-        trend_score = 0
-        reasons = []
-        if current_price > ema9:
-            trend_score += 2; reasons.append("price > EMA9")
-        else:
-            trend_score -= 1; reasons.append("price <= EMA9")
-        if ema9 > ema20:
-            trend_score += 2; reasons.append("EMA9 > EMA20 (bullish)")
-        else:
-            trend_score -= 2; reasons.append("EMA9 <= EMA20 (bearish)")
+        # Volume subplot
+        colors = ['green' if closes[i] >= opens[i] else 'red' for i in range(len(closes))]
+        ax2.bar(x, volumes, color=colors, alpha=0.6, width=0.0008)
+        ax2.set_title('Volume', fontsize=10)
+        ax2.set_ylabel('Volume', fontsize=9)
+        ax2.grid(True, alpha=0.3, linestyle='--')
+        ax2.tick_params(axis='x', rotation=45)
 
-        # Support/resistance
-        lvls = horizontal_levels(closes, highs, lows, lookback=50)
-        support = max([lv for lv in lvls if lv < current_price], default=None) if lvls else None
-        resistance = min([lv for lv in lvls if lv > current_price], default=None) if lvls else None
+        plt.tight_layout()
 
-        base_conf = 50
-        if trend_score >= 3:
-            base_conf += 20
-        elif trend_score == 2:
-            base_conf += 10
-        elif trend_score <= -3:
-            base_conf += 15
-        elif trend_score <= -1:
-            base_conf += 5
-        else:
-            base_conf -= 5
-
-        # Bullish candidate
-        if trend_score >= 2 and support:
-            entry = float(current_price)
-            sl = float(support) * 0.997 if support else entry * 0.985
-            tp = float(resistance) if resistance else entry * 1.05
-            denom = (entry - sl)
-            if denom > 0:
-                rr = (tp - entry) / denom
-                if rr >= rr_min:
-                    confidence = min(95, base_conf + trend_score*2)
-                    return {
-                        "side": "BUY",
-                        "entry": entry,
-                        "sl": sl,
-                        "tp": tp,
-                        "confidence": confidence,
-                        "reason": "; ".join(reasons[:3]),
-                        "trend_score": trend_score,
-                        "rr": round(rr, 2),
-                        "indicators": {"ema_9": ema9, "ema_20": ema20}
-                    }
-
-        # Bearish candidate
-        if trend_score <= -2 and resistance:
-            entry = float(current_price)
-            sl = float(resistance) * 1.003 if resistance else entry * 1.015
-            tp = float(support) if support else entry * 0.95
-            denom = (sl - entry)
-            if denom > 0:
-                rr = (entry - tp) / denom
-                if rr >= rr_min:
-                    confidence = min(95, base_conf + abs(trend_score)*2)
-                    return {
-                        "side": "SELL",
-                        "entry": entry,
-                        "sl": sl,
-                        "tp": tp,
-                        "confidence": confidence,
-                        "reason": "; ".join(reasons[:3]),
-                        "trend_score": trend_score,
-                        "rr": round(rr, 2),
-                        "indicators": {"ema_9": ema9, "ema_20": ema20}
-                    }
-
-        return {
-            "side": "none",
-            "confidence": base_conf,
-            "reason": "; ".join(reasons) if reasons else "no clear setup",
-            "trend_score": trend_score,
-            "indicators": {"ema_9": ema9, "ema_20": ema20}
-        }
+        # Save to bytes
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=120, bbox_inches='tight')
+        plt.close(fig)
+        buf.seek(0)
+        
+        return buf.getvalue()
 
     except Exception as e:
-        # Safety net
-        print(f"analyze_trade_logic fatal: {e}")
+        print(f"Chart generation error for {symbol}: {e}")
         traceback.print_exc()
-        return {"side": "none", "confidence": 0, "reason": f"internal error: {e}"}
+        # Return simple error image
+        fig = plt.figure(figsize=(12, 6))
+        plt.text(0.5, 0.5, f"{symbol}\nChart Error: {str(e)[:50]}", 
+                ha='center', va='center', fontsize=16)
+        plt.axis('off')
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        plt.close(fig)
+        buf.seek(0)
+        return buf.getvalue()
 
-# ---------------- Charting ----------------
-def plot_signal_chart(symbol, raw_candles, signal):
-    candles = normalize_klines(raw_candles)
-    if not candles:
-        # fallback simple text-image
-        tmp = NamedTemporaryFile(delete=False, suffix=".png")
-        plt.figure(figsize=(6,2)); plt.text(0.5,0.5,"No data",ha='center'); plt.axis('off'); plt.savefig(tmp.name); plt.close()
-        return tmp.name
-    dates = [datetime.utcfromtimestamp(c["ts"]/1000) if c["ts"] else datetime.utcnow() for c in candles]
-    closes = [c["close"] for c in candles]
-    opens = [c["open"] for c in candles]
-    highs = [c["high"] for c in candles]
-    lows = [c["low"] for c in candles]
+# ---------------- Qwen Vision Analysis ----------------
 
-    x = date2num(dates)
-    fig, (ax1, ax2) = plt.subplots(2,1, figsize=(14,8), gridspec_kw={'height_ratios':[3,1]})
-    # candlestick-ish
-    for i, (xi, o, h, l, c) in enumerate(zip(x, opens, highs, lows, closes)):
-        color = "green" if c >= o else "red"
-        ax1.vlines(xi, l, h, color=color, linewidth=0.8)
-        ax1.plot([xi, xi], [o, c], color=color, linewidth=3)
+async def analyze_chart_with_qwen(session, image_bytes, symbol, current_price):
+    """
+    Send chart image to Qwen 2.5 VL 72B for analysis via OpenRouter
+    """
+    if not OPENROUTER_API_KEY:
+        return {
+            "side": "none",
+            "confidence": 0,
+            "reason": "OpenRouter API key not configured",
+            "analysis": "API key missing"
+        }
 
-    # plot EMA9 & EMA20 over closes if available as full series
     try:
-        e9_series = ema(closes, 9)
-        e20_series = ema(closes, 20)
-        # only plot if lengths match x
-        if e9_series and len(e9_series) == len(x):
-            ax1.plot(x, e9_series, label='EMA9', linewidth=1.2)
-        if e20_series and len(e20_series) == len(x):
-            ax1.plot(x, e20_series, label='EMA20', linewidth=1.2)
-    except Exception:
-        pass
+        # Convert image to base64
+        image_base64 = base64.b64encode(image_bytes).decode('utf-8')
 
-    if signal.get('entry'): ax1.axhline(signal['entry'], linestyle='--', label=f"Entry {fmt_price(signal['entry'])}")
-    if signal.get('sl'): ax1.axhline(signal['sl'], linestyle='--', label=f"SL {fmt_price(signal['sl'])}")
-    if signal.get('tp'): ax1.axhline(signal['tp'], linestyle='--', label=f"TP {fmt_price(signal['tp'])}")
-    ax1.legend(loc='upper left', fontsize=9)
-    ax1.grid(True, alpha=0.3)
+        # Prepare request
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://crypto-scanner.local",
+            "X-Title": "Crypto Chart Analyzer"
+        }
 
-    # volume proxy
-    volumes = [abs(closes[i]-opens[i])*1000 for i in range(len(closes))]
-    ax2.bar(x, volumes, alpha=0.6)
-    ax2.set_title("Volume (proxy)")
-    plt.tight_layout()
-    tmp = NamedTemporaryFile(delete=False, suffix=".png")
-    fig.savefig(tmp.name, dpi=120, bbox_inches='tight')
-    plt.close(fig)
-    return tmp.name
+        prompt = f"""Analyze this {symbol} 1-hour cryptocurrency chart for SHORT-TERM/SCALPING trading.
 
-# ---------------- Fetch ----------------
+Current Price: {fmt_price(current_price)}
+
+⚡ PROVIDE PRECISE ANALYSIS:
+
+1. **TREND DIRECTION**: Bullish/Bearish/Sideways? (be specific)
+2. **SUPPORT LEVELS**: Identify key support levels visible on chart
+3. **RESISTANCE LEVELS**: Identify key resistance levels visible on chart
+4. **CANDLESTICK PATTERNS**: Any significant patterns? (Doji, Hammer, Engulfing, etc.)
+5. **CHART PATTERNS**: Head & Shoulders, Triangle, Flag, Wedge? 
+6. **MOVING AVERAGES**: Price position relative to MAs? Crossovers?
+7. **VOLUME ANALYSIS**: Volume increasing/decreasing? Confirmation?
+8. **MOMENTUM**: Is momentum bullish or bearish?
+
+🎯 TRADING SIGNAL (CRITICAL):
+- **ACTION**: BUY / SELL / HOLD (choose one)
+- **CONFIDENCE**: X/10 (be honest, not always high)
+- **ENTRY PRICE**: Specific price level
+- **STOP LOSS**: Where to place SL (critical for risk management)
+- **TAKE PROFIT 1**: First target
+- **TAKE PROFIT 2**: Second target (if applicable)
+- **TIMEFRAME**: Expected trade duration (15min, 1H, 4H, etc.)
+
+⚠️ IMPORTANT:
+- Only give BUY/SELL signal if confidence >= 7/10
+- Be precise with entry/SL/TP levels
+- Consider risk/reward ratio (minimum 1:1.5)
+- FALSE SIGNALS CAUSE LOSSES - be accurate!
+
+Format your response clearly with each point."""
+
+        payload = {
+            "model": OPENROUTER_MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{image_base64}"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ]
+                }
+            ],
+            "temperature": 0.2,  # Low for precise analysis
+            "max_tokens": 1500,
+            "top_p": 0.9
+        }
+
+        # Make async API call
+        async with session.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                print(f"❌ OpenRouter API error {response.status}: {error_text[:200]}")
+                return {
+                    "side": "none",
+                    "confidence": 0,
+                    "reason": f"API error: {response.status}",
+                    "analysis": error_text[:200]
+                }
+
+            result = await response.json()
+            
+            # Extract analysis
+            analysis_text = result['choices'][0]['message']['content']
+            
+            # Parse the analysis to extract signal
+            signal_data = parse_qwen_analysis(analysis_text, current_price)
+            signal_data['analysis'] = analysis_text
+            
+            # Check token usage
+            usage = result.get('usage', {})
+            print(f"   Tokens used: {usage.get('total_tokens', 'N/A')}")
+            
+            return signal_data
+
+    except asyncio.TimeoutError:
+        print(f"⏱️ Timeout analyzing {symbol}")
+        return {
+            "side": "none",
+            "confidence": 0,
+            "reason": "API timeout",
+            "analysis": "Request timed out"
+        }
+    except Exception as e:
+        print(f"❌ Qwen analysis error for {symbol}: {e}")
+        traceback.print_exc()
+        return {
+            "side": "none",
+            "confidence": 0,
+            "reason": f"Analysis error: {str(e)[:50]}",
+            "analysis": str(e)
+        }
+
+def parse_qwen_analysis(text, current_price):
+    """
+    Parse Qwen's text response to extract trading signal
+    """
+    try:
+        text_upper = text.upper()
+        
+        # Detect signal
+        side = "none"
+        if "ACTION: BUY" in text_upper or "ACTION**: BUY" in text_upper:
+            side = "BUY"
+        elif "ACTION: SELL" in text_upper or "ACTION**: SELL" in text_upper:
+            side = "SELL"
+        elif "BUY SIGNAL" in text_upper and "CONFIDENCE" in text_upper:
+            side = "BUY"
+        elif "SELL SIGNAL" in text_upper and "CONFIDENCE" in text_upper:
+            side = "SELL"
+        
+        # Extract confidence (X/10 format)
+        confidence = 0
+        import re
+        conf_match = re.search(r'CONFIDENCE[:\s]*(\d+)/10', text_upper)
+        if conf_match:
+            confidence = int(conf_match.group(1)) * 10  # Convert to percentage
+        else:
+            # Try percentage format
+            conf_match = re.search(r'CONFIDENCE[:\s]*(\d+)%', text_upper)
+            if conf_match:
+                confidence = int(conf_match.group(1))
+        
+        # Extract entry price
+        entry = current_price
+        entry_match = re.search(r'ENTRY[^\d]*(\d+\.?\d*)', text)
+        if entry_match:
+            try:
+                entry = float(entry_match.group(1))
+            except:
+                pass
+        
+        # Extract stop loss
+        sl = entry * 0.98 if side == "BUY" else entry * 1.02  # Default 2%
+        sl_match = re.search(r'STOP LOSS[^\d]*(\d+\.?\d*)', text)
+        if sl_match:
+            try:
+                sl = float(sl_match.group(1))
+            except:
+                pass
+        
+        # Extract take profit
+        tp = entry * 1.03 if side == "BUY" else entry * 0.97  # Default 3%
+        tp_match = re.search(r'TAKE PROFIT[^\d]*1?[^\d]*(\d+\.?\d*)', text)
+        if tp_match:
+            try:
+                tp = float(tp_match.group(1))
+            except:
+                pass
+        
+        # Calculate R:R
+        rr = 0
+        if side == "BUY" and (entry - sl) > 0:
+            rr = (tp - entry) / (entry - sl)
+        elif side == "SELL" and (sl - entry) > 0:
+            rr = (entry - tp) / (sl - entry)
+        
+        # Extract reason (first few lines)
+        reason_lines = text.split('\n')[:3]
+        reason = ' '.join([line.strip() for line in reason_lines if line.strip()])[:150]
+        
+        return {
+            "side": side,
+            "confidence": confidence,
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "rr": round(rr, 2),
+            "reason": reason
+        }
+    
+    except Exception as e:
+        print(f"Parse error: {e}")
+        return {
+            "side": "none",
+            "confidence": 0,
+            "entry": current_price,
+            "sl": 0,
+            "tp": 0,
+            "rr": 0,
+            "reason": "Failed to parse analysis"
+        }
+
+# ---------------- Fetch Data ----------------
+
 async def fetch_json(session, url):
+    """Fetch JSON from URL with error handling"""
     try:
-        async with session.get(url, timeout=60) as r:
+        async with session.get(url, timeout=30) as r:
             if r.status != 200:
-                # return None but print quick info for debugging
                 text = await r.text()
-                print(f"fetch_json {url} -> {r.status} : {text[:200]}")
+                print(f"   Fetch error {r.status}: {text[:100]}")
                 return None
             return await r.json()
     except Exception as e:
-        print(f"Fetch error for {url}: {e}")
-        return None
-
-# ---------------- Enhanced AI Analysis ----------------
-async def ask_openai_for_signals(symbol, emas, signal_data):
-    if not client:
-        return None
-    market_summary = {
-        "symbol": symbol,
-        "current_price": signal_data.get("entry", 0),
-        "trend_score": signal_data.get("trend_score", 0),
-        "ema_9": emas.get("ema_9"),
-        "ema_20": emas.get("ema_20"),
-        "local_signal": {
-            "side": signal_data.get("side"),
-            "confidence": signal_data.get("confidence"),
-            "rr": signal_data.get("rr"),
-            "reason": signal_data.get("reason")
-        }
-    }
-    system_prompt = ("You are an expert crypto trader. Analyze the provided market summary and either CONFIRM or REJECT "
-                     "the proposed trade. Provide a short CONF:% and brief reason.")
-    user_prompt = f"Market summary:\n{json.dumps(market_summary, indent=2)}\nRespond: CONFIRM/REJECT - CONF:xx% - REASON: short"
-    try:
-        loop = asyncio.get_running_loop()
-        def call():
-            return client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[{"role":"system","content":system_prompt},{"role":"user","content":user_prompt}],
-                max_tokens=200,
-                temperature=0.2
-            )
-        resp = await loop.run_in_executor(None, call)
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"OpenAI error: {e}")
+        print(f"   Fetch exception: {e}")
         return None
 
 # ---------------- Telegram ----------------
+
 async def send_text(session, text):
+    """Send text message to Telegram"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(text)
         return
+    
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        await session.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+        async with session.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}) as resp:
+            if resp.status != 200:
+                print(f"Telegram text error: {resp.status}")
     except Exception as e:
-        print(f"Telegram text error: {e}")
+        print(f"Telegram text exception: {e}")
 
-async def send_photo(session, caption, path):
+async def send_photo_bytes(session, caption, image_bytes):
+    """Send photo from bytes to Telegram"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(caption)
-        try:
-            os.unlink(path)
-        except Exception:
-            pass
         return
+    
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     try:
-        with open(path, "rb") as f:
-            data = aiohttp.FormData()
-            data.add_field("chat_id", TELEGRAM_CHAT_ID)
-            data.add_field("caption", caption)
-            data.add_field("photo", f)
-            await session.post(url, data=data)
+        data = aiohttp.FormData()
+        data.add_field("chat_id", TELEGRAM_CHAT_ID)
+        data.add_field("caption", caption[:1024])  # Telegram caption limit
+        data.add_field("photo", image_bytes, filename="chart.png", content_type="image/png")
+        
+        async with session.post(url, data=data) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                print(f"Telegram photo error {resp.status}: {error_text[:200]}")
     except Exception as e:
-        print(f"Telegram photo error: {e}")
-    finally:
-        try:
-            os.unlink(path)
-        except:
-            pass
+        print(f"Telegram photo exception: {e}")
 
-# ---------------- Main Enhanced Loop ----------------
-async def enhanced_loop():
+# ---------------- Main Loop ----------------
+
+async def main_scanner_loop():
+    """Main scanning loop - runs every 1 hour"""
+    
     async with aiohttp.ClientSession() as session:
-        startup = f"🤖 Enhanced Bot Started! • {len(SYMBOLS)} symbols • TF: 1H • Candles: {MIN_CANDLES_REQUIRED} • Poll: {POLL_INTERVAL}s"
-        print(startup)
-        await send_text(session, startup)
+        startup_msg = f"""🤖 Qwen VL Crypto Scanner Started!
 
+📊 Symbols: {len(SYMBOLS)} coins
+⏰ Scan Interval: {POLL_INTERVAL//60} minutes
+🔄 Rate Limit: {SCAN_DELAY} sec between scans
+🤖 Model: {OPENROUTER_MODEL}
+🎯 Confidence Threshold: {SIGNAL_CONF_THRESHOLD}%
+
+Starting first scan..."""
+        
+        print(startup_msg)
+        await send_text(session, startup_msg)
+        
         iteration = 0
+        
         while True:
             iteration += 1
-            print(f"\n{'='*60}")
-            print(f"ITERATION {iteration} @ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-            print(f"{'='*60}")
-
+            scan_start = datetime.utcnow()
+            
+            print(f"\n{'='*70}")
+            print(f"🔍 SCAN #{iteration} @ {scan_start.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            print(f"{'='*70}")
+            
             signals_found = 0
-
-            for sym in SYMBOLS:
+            scan_results = []
+            
+            for idx, symbol in enumerate(SYMBOLS, 1):
                 try:
-                    print(f"\n📊 Analyzing {sym}...")
-
-                    # Fetch 1H candle data (raw binance klines), last 720 candles
-                    c1h = await fetch_json(session, CANDLE_URL.format(symbol=sym))
-
-                    if not c1h:
-                        print(f"❌ Failed to fetch data for {sym} (1h:{bool(c1h)})")
+                    print(f"\n[{idx}/{len(SYMBOLS)}] 📊 Analyzing {symbol}...")
+                    
+                    # Fetch candle data
+                    candles = await fetch_json(session, CANDLE_URL.format(symbol=symbol))
+                    
+                    if not candles or len(candles) < 20:
+                        print(f"   ❌ Insufficient data for {symbol}")
                         continue
+                    
+                    # Get current price
+                    current_price = float(candles[-1][4])  # Close price of last candle
+                    print(f"   💰 Current price: {fmt_price(current_price)}")
+                    
+                    # Generate chart
+                    print(f"   📈 Generating chart...")
+                    chart_bytes = generate_chart_image(symbol, candles)
+                    
+                    # Analyze with Qwen Vision
+                    print(f"   🤖 Analyzing with Qwen VL...")
+                    signal = await analyze_chart_with_qwen(session, chart_bytes, symbol, current_price)
+                    
+                    # Check if signal meets threshold
+                    if signal['side'] != 'none' and signal['confidence'] >= SIGNAL_CONF_THRESHOLD:
+                        signals_found += 1
+                        
+                        # Prepare message
+                        msg = f"""🚀 {symbol} {signal['side']} SIGNAL
 
-                    # Use raw klines directly (normalize inside analysis)
-                    local_signal = analyze_trade_logic(c1h)
+📈 Entry: {fmt_price(signal['entry'])}
+🛑 Stop Loss: {fmt_price(signal['sl'])}
+🎯 Take Profit: {fmt_price(signal['tp'])}
+📊 Confidence: {signal['confidence']}%
+⚖️ Risk/Reward: 1:{signal['rr']}
 
-                    if local_signal.get("side") != "none" and local_signal.get("confidence", 0) >= SIGNAL_CONF_THRESHOLD:
-                        # Compute EMAs from closes for AI & chart
-                        normalized = normalize_klines(c1h)
-                        closes = [c["close"] for c in normalized]
-                        emas = calculate_emas_9_20(closes)
+💡 Analysis:
+{signal.get('reason', '')[:200]}
 
-                        # Ask AI for confirmation
-                        ai_response = await ask_openai_for_signals(sym, emas, local_signal)
-                        ai_boost = 0
-                        if ai_response and "CONFIRM" in ai_response.upper():
-                            ai_boost = 10
-                            print(f"✅ AI confirmed signal for {sym}")
-                        elif ai_response and "REJECT" in ai_response.upper():
-                            ai_boost = -15
-                            print(f"❌ AI rejected signal for {sym}")
-
-                        final_confidence = min(95, int(local_signal.get("confidence",0) + ai_boost))
-
-                        if final_confidence >= SIGNAL_CONF_THRESHOLD:
-                            signals_found += 1
-                            msg = (f"🚀 {sym} {local_signal['side']} SIGNAL\n"
-                                   f"📈 Entry: {fmt_price(local_signal['entry'])}\n"
-                                   f"🛑 Stop Loss: {fmt_price(local_signal['sl'])}\n"
-                                   f"🎯 Take Profit: {fmt_price(local_signal['tp'])}\n"
-                                   f"📊 Confidence: {final_confidence}%\n"
-                                   f"⚖️ Risk/Reward: 1:{local_signal.get('rr',0)}\n"
-                                   f"💡 Reason: {local_signal.get('reason','')[:140]}")
-
-                            chart_path = plot_signal_chart(sym, c1h, local_signal)
-                            await send_photo(session, msg, chart_path)
-                            print(f"⚡ SIGNAL SENT: {sym} {local_signal['side']} | Conf: {final_confidence}%")
-                        else:
-                            print(f"📉 {sym}: Signal confidence too low ({final_confidence}%)")
+🤖 Model: Qwen 2.5 VL 72B"""
+                        
+                        # Send to Telegram with chart
+                        await send_photo_bytes(session, msg, chart_bytes)
+                        
+                        print(f"   ✅ SIGNAL SENT: {signal['side']} | Conf: {signal['confidence']}%")
+                        
+                        scan_results.append({
+                            "symbol": symbol,
+                            "signal": signal['side'],
+                            "confidence": signal['confidence']
+                        })
                     else:
-                        print(f"📊 {sym}: No signal (Conf: {local_signal.get('confidence',0)}%, Reason: {local_signal.get('reason')})")
-
+                        print(f"   📉 No signal (Conf: {signal['confidence']}% | {signal['side']})")
+                        print(f"      Reason: {signal.get('reason', 'N/A')[:80]}")
+                    
+                    # Rate limit delay (10 seconds between scans)
+                    if idx < len(SYMBOLS):
+                        print(f"   ⏳ Waiting {SCAN_DELAY}s (rate limit)...")
+                        await asyncio.sleep(SCAN_DELAY)
+                
                 except Exception as e:
-                    print(f"❌ Error analyzing {sym}: {e}")
+                    print(f"   ❌ Error analyzing {symbol}: {e}")
                     traceback.print_exc()
+                    continue
+            
+            # Scan summary
+            scan_duration = (datetime.utcnow() - scan_start).total_seconds()
+            
+            summary = f"""📊 Scan #{iteration} Complete
 
-            print(f"\n📊 Iteration {iteration} complete: {signals_found} signals found")
-            if signals_found == 0:
-                summary_msg = (f"📊 Scan #{iteration} Complete\n"
-                               f"✅ {len(SYMBOLS)} symbols analyzed\n"
-                               f"📈 0 signals above {int(SIGNAL_CONF_THRESHOLD)}% threshold\n"
-                               f"⏰ Next scan in {POLL_INTERVAL//60}min")
-                await send_text(session, summary_msg)
+✅ Analyzed: {len(SYMBOLS)} symbols
+🎯 Signals Found: {signals_found}
+⏱️ Duration: {scan_duration:.1f}s
+🔄 Next scan: {POLL_INTERVAL//60} minutes
 
+{'─'*40}"""
+            
+            if signals_found > 0:
+                summary += "\n🚀 Signals:\n"
+                for result in scan_results:
+                    summary += f"• {result['symbol']}: {result['signal']} ({result['confidence']}%)\n"
+            
+            print(f"\n{summary}")
+            await send_text(session, summary)
+            
+            # Wait for next scan
+            print(f"\n💤 Sleeping for {POLL_INTERVAL//60} minutes...")
             await asyncio.sleep(POLL_INTERVAL)
+
+# ---------------- Entry Point ----------------
 
 if __name__ == "__main__":
     try:
-        asyncio.run(enhanced_loop())
+        print("🚀 Starting Qwen VL Crypto Scanner...")
+        asyncio.run(main_scanner_loop())
     except KeyboardInterrupt:
         print("\n🛑 Bot stopped by user")
     except Exception as e:
