@@ -38,18 +38,17 @@ redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 # Constants
 DERIBIT_BASE = "https://www.deribit.com/api/v2/public"
 SYMBOLS = ['BTC-PERPETUAL', 'ETH-PERPETUAL']
-TIMEFRAMES = ['30', '60', '240']  # 30m, 1h, 4h in minutes
+TIMEFRAMES = ['30', '60', '240']
 MAX_TRADES_PER_DAY = 8
-CANDLE_COUNT = 500  # 500 candles for all timeframes
+CANDLE_COUNT = 500
 
 class DeribitClient:
     """Fetch data from Deribit public API"""
     
-    # Resolution mapping for Deribit
     RESOLUTION_MAP = {
-        '30': '30',   # 30 minutes
-        '60': '60',   # 1 hour
-        '240': '1D'   # Use daily for 4h (Deribit limitation)
+        '30': '30',
+        '60': '60',
+        '240': '1D'
     }
     
     @staticmethod
@@ -58,15 +57,11 @@ class DeribitClient:
         
         logger.info(f"📊 Fetching {count} candles for {symbol} {timeframe}m...")
         
-        # For 4hr, we'll use daily candles as Deribit may not support 240
         resolution = DeribitClient.RESOLUTION_MAP.get(timeframe, timeframe)
-        
         url = f"{DERIBIT_BASE}/get_tradingview_chart_data"
         
-        # Calculate time range
         tf_minutes = int(timeframe)
         if timeframe == '240':
-            # Daily candles
             days_needed = count + 10
         else:
             days_needed = (count * tf_minutes) // (24 * 60) + 10
@@ -81,39 +76,32 @@ class DeribitClient:
         try:
             response = requests.get(url, params=params, timeout=15)
             
-            # Check HTTP status
             if response.status_code != 200:
                 logger.error(f"❌ Deribit API HTTP {response.status_code} for {symbol} {timeframe}m")
                 return pd.DataFrame()
             
             data = response.json()
             
-            # Check for error in response
             if 'error' in data:
                 logger.error(f"❌ Deribit API error for {symbol} {timeframe}m: {data['error']}")
                 return pd.DataFrame()
             
-            # Check result exists
             if 'result' not in data:
-                logger.error(f"❌ No 'result' in Deribit response for {symbol} {timeframe}m")
-                logger.debug(f"Response: {str(data)[:200]}")
+                logger.error(f"❌ No result in Deribit response for {symbol} {timeframe}m")
                 return pd.DataFrame()
             
             result = data['result']
             
-            # Validate result structure
             if result.get('status') != 'ok':
-                logger.error(f"❌ Deribit status not OK for {symbol} {timeframe}m: {result.get('status')}")
+                logger.error(f"❌ Deribit status not OK for {symbol} {timeframe}m")
                 return pd.DataFrame()
             
-            # Check required fields
             required_fields = ['ticks', 'open', 'high', 'low', 'close', 'volume']
             missing = [f for f in required_fields if f not in result]
             if missing:
-                logger.error(f"❌ Missing fields in Deribit response for {symbol} {timeframe}m: {missing}")
+                logger.error(f"❌ Missing fields for {symbol} {timeframe}m: {missing}")
                 return pd.DataFrame()
             
-            # Create DataFrame
             df = pd.DataFrame({
                 'timestamp': pd.to_datetime(result['ticks'], unit='ms'),
                 'open': result['open'],
@@ -129,21 +117,16 @@ class DeribitClient:
             
             df.set_index('timestamp', inplace=True)
             
-            # For 4hr timeframe using daily data, resample
             if timeframe == '240':
                 logger.info(f"ℹ️ Using daily data for 4hr timeframe {symbol}")
             
-            logger.info(f"✅ Fetched {len(df)} candles for {symbol} {resolution} ({timeframe}m requested)")
+            logger.info(f"✅ Fetched {len(df)} candles for {symbol} {resolution}")
             return df.tail(count)
             
         except requests.exceptions.Timeout:
-            logger.error(f"⏱️ Timeout fetching candles for {symbol} {timeframe}m")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"🌐 Request error fetching candles for {symbol} {timeframe}m: {e}")
-        except KeyError as e:
-            logger.error(f"🔑 KeyError in Deribit data for {symbol} {timeframe}m: {e}")
+            logger.error(f"⏱️ Timeout fetching {symbol} {timeframe}m")
         except Exception as e:
-            logger.error(f"💥 Unexpected error fetching candles for {symbol} {timeframe}m: {e}", exc_info=True)
+            logger.error(f"💥 Error fetching {symbol} {timeframe}m: {e}")
         
         return pd.DataFrame()
     
@@ -164,7 +147,7 @@ class DeribitClient:
                 volume = data['result'].get('stats', {}).get('volume', 0)
                 mark = data['result'].get('mark_price', 0)
                 
-                logger.info(f"📊 {symbol} OI: {oi:,.0f}, Volume 24h: {volume:,.2f}, Mark: ${mark:,.2f}")
+                logger.info(f"📊 {symbol} OI: {oi:,.0f}, Vol: {volume:,.2f}, Mark: ${mark:,.2f}")
                 
                 return {
                     'open_interest': oi,
@@ -186,7 +169,6 @@ class TechnicalAnalyzer:
         swing_lows = []
         
         for i in range(period, len(df) - period):
-            # Swing high
             if df['high'].iloc[i] == df['high'].iloc[i-period:i+period+1].max():
                 swing_highs.append({
                     'price': df['high'].iloc[i], 
@@ -194,7 +176,6 @@ class TechnicalAnalyzer:
                     'timestamp': df.index[i]
                 })
             
-            # Swing low
             if df['low'].iloc[i] == df['low'].iloc[i-period:i+period+1].min():
                 swing_lows.append({
                     'price': df['low'].iloc[i], 
@@ -202,46 +183,7 @@ class TechnicalAnalyzer:
                     'timestamp': df.index[i]
                 })
         
-        return swing_highs[-7:], swing_lows[-7:]  # Last 7 swing points
-    
-    @staticmethod
-    def find_trendlines(swing_points: List, df: pd.DataFrame, is_resistance: bool = True) -> List[Dict]:
-        """Find trendlines from swing points"""
-        if len(swing_points) < 2:
-            return []
-        
-        trendlines = []
-        
-        # Try connecting recent swing points
-        for i in range(len(swing_points) - 1):
-            for j in range(i + 1, len(swing_points)):
-                point1 = swing_points[i]
-                point2 = swing_points[j]
-                
-                # Calculate slope
-                x_diff = point2['index'] - point1['index']
-                y_diff = point2['price'] - point1['price']
-                
-                if x_diff == 0:
-                    continue
-                
-                slope = y_diff / x_diff
-                
-                # Project to current
-                current_index = len(df) - 1
-                projected_price = point2['price'] + slope * (current_index - point2['index'])
-                
-                trendlines.append({
-                    'start_price': point1['price'],
-                    'end_price': projected_price,
-                    'start_index': point1['index'],
-                    'end_index': current_index,
-                    'slope': slope,
-                    'type': 'resistance' if is_resistance else 'support'
-                })
-        
-        # Return most relevant trendlines
-        return sorted(trendlines, key=lambda x: abs(x['slope']))[:3]
+        return swing_highs[-7:], swing_lows[-7:]
     
     @staticmethod
     def detect_patterns(df: pd.DataFrame) -> List[Dict]:
@@ -253,57 +195,43 @@ class TechnicalAnalyzer:
         
         last = df.iloc[-1]
         prev = df.iloc[-2]
-        prev2 = df.iloc[-3] if len(df) >= 3 else None
         
         body = abs(last['close'] - last['open'])
         upper_wick = last['high'] - max(last['open'], last['close'])
         lower_wick = min(last['open'], last['close']) - last['low']
         candle_range = last['high'] - last['low']
         
-        # Candlestick Patterns
         if candle_range > 0:
-            # Doji
             if body < candle_range * 0.1:
                 patterns.append({'type': 'candlestick', 'name': 'Doji', 'signal': 'neutral'})
             
-            # Hammer
             if lower_wick > body * 2 and upper_wick < body * 0.5 and last['close'] > last['open']:
                 patterns.append({'type': 'candlestick', 'name': 'Hammer', 'signal': 'bullish'})
             
-            # Shooting Star
             if upper_wick > body * 2 and lower_wick < body * 0.5 and last['close'] < last['open']:
                 patterns.append({'type': 'candlestick', 'name': 'Shooting Star', 'signal': 'bearish'})
             
-            # Bullish Engulfing
             if (prev['close'] < prev['open'] and 
                 last['close'] > last['open'] and 
                 last['close'] > prev['open'] and 
                 last['open'] < prev['close']):
                 patterns.append({'type': 'candlestick', 'name': 'Bullish Engulfing', 'signal': 'bullish'})
             
-            # Bearish Engulfing
             if (prev['close'] > prev['open'] and 
                 last['close'] < last['open'] and 
                 last['close'] < prev['open'] and 
                 last['open'] > prev['close']):
                 patterns.append({'type': 'candlestick', 'name': 'Bearish Engulfing', 'signal': 'bearish'})
         
-        # Chart Patterns (simplified)
         if len(df) >= 20:
             recent = df.tail(20)
-            
-            # Triangle detection (price consolidation)
             highs = recent['high'].values
             lows = recent['low'].values
             
             if max(highs[-10:]) < max(highs[:10]) and min(lows[-10:]) > min(lows[:10]):
                 patterns.append({'type': 'chart', 'name': 'Symmetrical Triangle', 'signal': 'breakout_pending'})
-            
-            # Ascending Triangle
             elif abs(max(highs[-10:]) - max(highs[:10])) < (max(highs) * 0.01) and min(lows[-10:]) > min(lows[:10]):
                 patterns.append({'type': 'chart', 'name': 'Ascending Triangle', 'signal': 'bullish'})
-            
-            # Descending Triangle
             elif abs(min(lows[-10:]) - min(lows[:10])) < (min(lows) * 0.01) and max(highs[-10:]) < max(highs[:10]):
                 patterns.append({'type': 'chart', 'name': 'Descending Triangle', 'signal': 'bearish'})
         
@@ -339,8 +267,8 @@ class OITracker:
     def store_oi(symbol: str, oi_data: Dict):
         """Store current OI in Redis with timestamp"""
         key = f"oi:{symbol}:{int(datetime.now().timestamp())}"
-        redis_client.setex(key, 7200, json.dumps(oi_data))  # 2hr expiry
-        logger.info(f"💾 Stored OI data for {symbol}: {oi_data}")
+        redis_client.setex(key, 7200, json.dumps(oi_data))
+        logger.info(f"💾 Stored OI data for {symbol}: OI={oi_data.get('open_interest', 0):,.0f}")
     
     @staticmethod
     def get_oi_history(symbol: str, hours: int = 2) -> List[Dict]:
@@ -351,7 +279,7 @@ class OITracker:
         history = []
         try:
             keys = list(redis_client.scan_iter(match=pattern))
-            logger.info(f"📚 Found {len(keys)} OI records for {symbol} in last {hours}h")
+            logger.info(f"📚 Found {len(keys)} OI records for {symbol}")
             
             for key in keys:
                 timestamp = int(key.split(':')[-1])
@@ -360,7 +288,7 @@ class OITracker:
                     data['timestamp'] = timestamp
                     history.append(data)
         except Exception as e:
-            logger.error(f"❌ Redis error getting OI history: {e}")
+            logger.error(f"❌ Redis error: {e}")
         
         return sorted(history, key=lambda x: x['timestamp'])
     
@@ -370,7 +298,7 @@ class OITracker:
         history = OITracker.get_oi_history(symbol, hours=2)
         
         if len(history) < 2:
-            logger.warning(f"⚠️ Insufficient OI data for {symbol}: {len(history)} records")
+            logger.warning(f"⚠️ Insufficient OI data for {symbol}")
             return {'trend': 'insufficient_data', 'change': 0, 'supporting_sr': None}
         
         current_oi = history[-1]['open_interest']
@@ -388,14 +316,14 @@ class OITracker:
         else:
             trend = 'stable'
         
-        logger.info(f"📊 {symbol} OI Trend: {trend} ({change:+.2f}% change)")
+        logger.info(f"📊 {symbol} OI Trend: {trend} ({change:+.2f}%)")
         
         return {
             'trend': trend,
             'change': round(change, 2),
             'current_oi': current_oi,
             'previous_oi': old_oi,
-            'supporting_sr': None  # Will be set by analyzer
+            'supporting_sr': None
         }
 
 class ChartGenerator:
@@ -407,7 +335,6 @@ class ChartGenerator:
         
         logger.info(f"📈 Generating chart for {symbol}...")
         
-        # Setup white background style
         mc = mpf.make_marketcolors(
             up='#26a69a',
             down='#ef5350',
@@ -426,9 +353,8 @@ class ChartGenerator:
             y_on_right=False
         )
         
-        # Create figure
         fig, axes = mpf.plot(
-            df.tail(100),  # Show last 100 candles
+            df.tail(100),
             type='candle',
             style=s,
             volume=True,
@@ -441,39 +367,29 @@ class ChartGenerator:
         
         ax = axes[0]
         
-        # Get data range for plotting
-        plot_df = df.tail(100)
-        x_range = range(len(plot_df))
-        
-        # Plot Support levels (green)
         if 'swing_lows_30m' in analysis:
-            for swing in analysis['swing_lows_30m'][-3:]:  # Last 3 swing lows
+            for swing in analysis['swing_lows_30m'][-3:]:
                 price = swing['price']
                 ax.axhline(y=price, color='#4caf50', linestyle='--', linewidth=1.5, alpha=0.7, label='Support 30m')
         
-        # Plot Resistance levels (red)
         if 'swing_highs_30m' in analysis:
             for swing in analysis['swing_highs_30m'][-3:]:
                 price = swing['price']
                 ax.axhline(y=price, color='#f44336', linestyle='--', linewidth=1.5, alpha=0.7, label='Resistance 30m')
         
-        # Plot 4H S/R (thicker lines)
         if analysis.get('support_4h'):
             ax.axhline(y=analysis['support_4h'], color='#2e7d32', linestyle='-', linewidth=2, label='Support 4H')
         
         if analysis.get('resistance_4h'):
             ax.axhline(y=analysis['resistance_4h'], color='#c62828', linestyle='-', linewidth=2, label='Resistance 4H')
         
-        # Mark OI supported S/R (blue)
         if analysis.get('oi_trend', {}).get('supporting_sr'):
             sr_price = analysis['oi_trend']['supporting_sr']
-            ax.axhline(y=sr_price, color='#2196f3', linestyle='-.', linewidth=2.5, label='OI Support/Resistance')
+            ax.axhline(y=sr_price, color='#2196f3', linestyle='-.', linewidth=2.5, label='OI S/R')
         
-        # Mark current price
         current_price = df['close'].iloc[-1]
         ax.axhline(y=current_price, color='#ff9800', linestyle=':', linewidth=2, label=f'Current: ${current_price:.2f}')
         
-        # Add pattern annotations
         if analysis.get('patterns'):
             pattern_text = "\n".join([p['name'] for p in analysis['patterns'][:3]])
             ax.text(
@@ -485,7 +401,6 @@ class ChartGenerator:
                 fontsize=10
             )
         
-        # Add trade signal box
         if analysis.get('trade_signal'):
             signal = analysis['trade_signal']
             signal_color = '#4caf50' if 'LONG' in signal else '#f44336' if 'SHORT' in signal else '#9e9e9e'
@@ -509,12 +424,10 @@ class ChartGenerator:
                 fontweight='bold'
             )
         
-        # Clean up legend (remove duplicates)
         handles, labels = ax.get_legend_handles_labels()
         by_label = dict(zip(labels, handles))
         ax.legend(by_label.values(), by_label.keys(), loc='upper left', fontsize=8)
         
-        # Save to BytesIO
         buf = io.BytesIO()
         plt.tight_layout()
         fig.savefig(buf, format='png', dpi=150, facecolor='white')
@@ -534,7 +447,6 @@ class TradeAnalyzer:
         logger.info(f"🔍 ANALYZING {symbol}")
         logger.info(f"{'='*60}")
         
-        # Fetch multi-timeframe data (500 candles each)
         df_30m = DeribitClient.get_candles(symbol, '30', CANDLE_COUNT)
         df_1h = DeribitClient.get_candles(symbol, '60', CANDLE_COUNT)
         df_4h = DeribitClient.get_candles(symbol, '240', CANDLE_COUNT)
@@ -543,14 +455,12 @@ class TradeAnalyzer:
             logger.error(f"❌ Insufficient data for {symbol}")
             return {'valid': False, 'reason': 'Insufficient data', 'symbol': symbol}
         
-        logger.info(f"✅ {symbol}: Loaded {len(df_30m)} x 30m, {len(df_1h)} x 1h, {len(df_4h)} x 4h candles")
+        logger.info(f"✅ {symbol}: Loaded {len(df_30m)}x30m, {len(df_1h)}x1h, {len(df_4h)}x4h candles")
         
-        # Get OI data
         oi_data = DeribitClient.get_order_book(symbol)
         OITracker.store_oi(symbol, oi_data)
         oi_trend = OITracker.analyze_oi_trend(symbol)
         
-        # Technical analysis
         swing_highs_30m, swing_lows_30m = TechnicalAnalyzer.find_swing_points(df_30m)
         swing_highs_1h, swing_lows_1h = TechnicalAnalyzer.find_swing_points(df_1h)
         swing_highs_4h, swing_lows_4h = TechnicalAnalyzer.find_swing_points(df_4h)
@@ -566,25 +476,22 @@ class TradeAnalyzer:
         volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
         
         logger.info(f"💰 Price: ${current_price:.2f}")
-        logger.info(f"📊 Volume Ratio: {volume_ratio:.2f}x (avg: {avg_volume:.2f}, current: {current_volume:.2f})")
+        logger.info(f"📊 Volume: {volume_ratio:.2f}x (current: {current_volume:.2f}, avg: {avg_volume:.2f})")
         
-        # Determine OI supported S/R
         oi_sr = None
         if oi_trend['trend'] in ['increasing', 'strongly_increasing']:
-            # OI increasing - check if near resistance (bearish) or support (bullish)
             recent_high = df_30m['high'].tail(10).max()
             recent_low = df_30m['low'].tail(10).min()
             
             if abs(current_price - recent_high) < abs(current_price - recent_low):
-                oi_sr = recent_high  # Near resistance
+                oi_sr = recent_high
                 logger.info(f"🔵 OI increasing near resistance: ${oi_sr:.2f}")
             else:
-                oi_sr = recent_low  # Near support
+                oi_sr = recent_low
                 logger.info(f"🔵 OI increasing near support: ${oi_sr:.2f}")
         
         oi_trend['supporting_sr'] = oi_sr
         
-        # Determine trade setup
         analysis = {
             'symbol': symbol,
             'current_price': current_price,
@@ -599,7 +506,7 @@ class TradeAnalyzer:
             'resistance_4h': swing_highs_4h[-1]['price'] if swing_highs_4h else None,
             'support_4h': swing_lows_4h[-1]['price'] if swing_lows_4h else None,
             'volume_profile': volume_profile,
-            'df_30m': df_30m,  # For chart generation
+            'df_30m': df_30m,
             'valid': True
         }
         
@@ -608,13 +515,12 @@ class TradeAnalyzer:
     
     @staticmethod
     def get_ai_analysis(analysis: Dict) -> Dict:
-        """Get GPT-4o mini analysis - IMPROVED VERSION"""
+        """Get GPT-4o mini analysis"""
         
         logger.info(f"\n🤖 Calling OpenAI for {analysis['symbol']}...")
         
         patterns_text = "\n".join([f"- {p['name']} ({p['signal']})" for p in analysis.get('patterns', [])]) if analysis.get('patterns') else "None detected"
         
-        # Get S/R levels
         support_30m = analysis['swing_lows_30m'][-1]['price'] if analysis.get('swing_lows_30m') else None
         resistance_30m = analysis['swing_highs_30m'][-1]['price'] if analysis.get('swing_highs_30m') else None
         
@@ -671,7 +577,6 @@ REASON: [why not]"""
             ai_text = response.choices[0].message.content
             logger.info(f"📝 OpenAI response (first 150 chars): {ai_text[:150]}...")
             
-            # Parse AI response
             result = {
                 'signal': 'NO_TRADE',
                 'entry': None,
@@ -694,399 +599,8 @@ REASON: [why not]"""
                 
                 elif 'ENTRY:' in line:
                     try:
-                        # Extract number
                         entry_str = line.split('ENTRY:')[-1].strip()
-                        entry_str = entry_str.replace('
-                
-                elif 'PATTERN:' in line:
-                    result['pattern'] = line.split('PATTERN:')[-1].strip()
-                
-                elif 'REASON:' in line:
-                    result['reason'] = line.split('REASON:')[-1].strip()
-            
-            # If no reason captured, use full response
-            if result['reason'] == 'No clear setup':
-                result['reason'] = ai_text
-            
-            logger.info(f"🎯 Parsed AI result: {result['signal']} - {result.get('pattern', 'No pattern')}")
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"❌ GPT API error for {analysis['symbol']}: {e}", exc_info=True)
-            return {
-                'signal': 'ERROR',
-                'reason': f'AI analysis failed: {str(e)}',
-                'entry': None,
-                'sl': None,
-                'target': None,
-                'pattern': 'Error'
-            }
-
-class TradingBot:
-    """Main bot logic"""
-    
-    def __init__(self):
-        self.trade_count_today = 0
-        self.last_reset = datetime.now().date()
-        self.bot_start_time = datetime.now()
-    
-    def reset_daily_counter(self):
-        """Reset trade counter at midnight"""
-        if datetime.now().date() > self.last_reset:
-            self.trade_count_today = 0
-            self.last_reset = datetime.now().date()
-            logger.info("🔄 Trade counter reset for new day")
-    
-    async def scan_markets(self, context: ContextTypes.DEFAULT_TYPE):
-        """Scan all symbols for setups - FIXED VERSION"""
-        logger.info(f"\n{'='*80}")
-        logger.info(f"🚀 STARTING MARKET SCAN - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        logger.info(f"{'='*80}")
-        
-        self.reset_daily_counter()
-        
-        if self.trade_count_today >= MAX_TRADES_PER_DAY:
-            logger.info(f"⛔ Daily limit reached: {self.trade_count_today}/{MAX_TRADES_PER_DAY}")
-            return
-        
-        for symbol in SYMBOLS:
-            try:
-                logger.info(f"\n📊 Scanning {symbol}...")
-                analysis = TradeAnalyzer.analyze_setup(symbol)
-                
-                # Check if data fetch failed
-                if not analysis or not analysis.get('valid'):
-                    logger.warning(f"⚠️ {symbol}: Invalid data, skipping")
-                    continue
-                
-                logger.info(f"💵 {symbol}: Price=${analysis['current_price']:.2f}, Volume={analysis['volume_ratio']}x, Patterns={len(analysis.get('patterns', []))}")
-                
-                # RELAXED FILTERS - Allow more setups to reach AI
-                patterns = analysis.get('patterns', [])
-                volume_ratio = analysis.get('volume_ratio', 0)
-                
-                # Change 1: Lower volume threshold to 1.2x
-                if volume_ratio < 1.2:
-                    logger.info(f"❌ {symbol}: Volume too low ({volume_ratio}x < 1.2x)")
-                    continue
-                
-                # Change 2: Allow if either patterns exist OR volume is high
-                if len(patterns) == 0 and volume_ratio < 2.0:
-                    logger.info(f"❌ {symbol}: No patterns and volume not exceptional")
-                    continue
-                
-                logger.info(f"✅ {symbol}: Passed filters, sending to AI analysis...")
-                
-                # Get AI analysis
-                ai_result = TradeAnalyzer.get_ai_analysis(analysis)
-                
-                logger.info(f"🎯 {symbol}: AI Signal = {ai_result['signal']}")
-                
-                # Check if valid signal
-                if ai_result['signal'] in ['LONG', 'SHORT']:
-                    self.trade_count_today += 1
-                    logger.info(f"🎉 {symbol}: VALID {ai_result['signal']} SIGNAL - Trade #{self.trade_count_today}")
-                    
-                    # Add AI results to analysis for chart
-                    analysis['trade_signal'] = ai_result['signal']
-                    analysis['entry_price'] = ai_result.get('entry')
-                    analysis['sl_price'] = ai_result.get('sl')
-                    analysis['target_price'] = ai_result.get('target')
-                    analysis['trade_type'] = ai_result.get('pattern', 'Breakout')
-                    
-                    await self.send_alert(context, symbol, analysis, ai_result)
-                else:
-                    logger.info(f"⏭️ {symbol}: {ai_result['signal']} - {ai_result.get('reason', '')[:80]}")
-                
-            except Exception as e:
-                logger.error(f"💥 Error scanning {symbol}: {e}", exc_info=True)
-            
-            await asyncio.sleep(3)  # Rate limit between symbols
-        
-        logger.info(f"\n{'='*80}")
-        logger.info(f"✅ SCAN COMPLETE - Trades today: {self.trade_count_today}/{MAX_TRADES_PER_DAY}")
-        logger.info(f"{'='*80}\n")
-    
-    async def send_alert(self, context: ContextTypes.DEFAULT_TYPE, symbol: str, analysis: Dict, ai_result: Dict):
-        """Send trade alert with chart to Telegram"""
-        
-        logger.info(f"📤 Sending alert for {symbol}...")
-        
-        # Generate chart
-        try:
-            chart_buf = ChartGenerator.create_chart(analysis['df_30m'], analysis, symbol)
-        except Exception as e:
-            logger.error(f"❌ Chart generation error: {e}")
-            chart_buf = None
-        
-        # Prepare text message
-        patterns_text = ", ".join([p['name'] for p in analysis['patterns'][:3]])
-        
-        oi_emoji = "📈" if "increasing" in analysis['oi_trend']['trend'] else "📉" if "decreasing" in analysis['oi_trend']['trend'] else "➡️"
-        signal_emoji = "🟢" if ai_result['signal'] == 'LONG' else "🔴"
-        
-        # Calculate R:R
-        try:
-            rr = abs((ai_result['target'] - ai_result['entry']) / (ai_result['entry'] - ai_result['sl']))
-        except:
-            rr = 0
-        
-        message = f"""{signal_emoji} **{analysis['symbol']} - {ai_result['signal']} SETUP**
-
-📊 **Pattern:** {ai_result['pattern']}
-💰 **Price:** ${analysis['current_price']:.2f}
-
-🎯 **TRADE DETAILS:**
-├ Entry: ${ai_result['entry']:.2f}
-├ Stop Loss: ${ai_result['sl']:.2f}
-├ Target: ${ai_result['target']:.2f}
-└ R:R = 1:{rr:.1f}
-
-✅ **CONFIRMATIONS:**
-├ Patterns: {patterns_text}
-├ Volume: {analysis['volume_ratio']}x avg
-└ OI: {oi_emoji} {analysis['oi_trend']['trend']} ({analysis['oi_trend']['change']:+.1f}%)
-
-📈 **SUPPORT & RESISTANCE:**
-├ 30m Support: ${analysis['swing_lows_30m'][-1]['price']:.2f if analysis['swing_lows_30m'] else 'N/A'}
-├ 30m Resistance: ${analysis['swing_highs_30m'][-1]['price']:.2f if analysis['swing_highs_30m'] else 'N/A'}
-├ 4H Support: ${analysis['support_4h']:.2f if analysis['support_4h'] else 'N/A'}
-└ 4H Resistance: ${analysis['resistance_4h']:.2f if analysis['resistance_4h'] else 'N/A'}
-
-💡 **Analysis:** {ai_result['reason']}
-
-⚠️ Trade #{self.trade_count_today}/{MAX_TRADES_PER_DAY} today
-"""
-        
-        try:
-            # Send chart first
-            if chart_buf:
-                await context.bot.send_photo(
-                    chat_id=CHAT_ID,
-                    photo=chart_buf,
-                    caption=message,
-                    parse_mode='Markdown'
-                )
-            else:
-                # If chart fails, send text only
-                await context.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=message,
-                    parse_mode='Markdown'
-                )
-            
-            logger.info(f"✅ Alert sent for {symbol}: {ai_result['signal']}")
-            
-        except Exception as e:
-            logger.error(f"❌ Error sending alert: {e}")
-    
-    async def send_startup_alert(self, context: ContextTypes.DEFAULT_TYPE):
-        """Send startup notification"""
-        startup_message = f"""🤖 **TRADING BOT STARTED**
-
-✅ Status: Online and Active
-🕐 Started: {self.bot_start_time.strftime('%Y-%m-%d %H:%M:%S')}
-
-📊 **Configuration:**
-├ Symbols: {', '.join(SYMBOLS)}
-├ Timeframes: 30m, 1h, 4h
-├ Candles per TF: {CANDLE_COUNT}
-├ Max Trades/Day: {MAX_TRADES_PER_DAY}
-└ Scan Interval: Every 30 minutes
-
-🔧 **Systems:**
-├ ✅ Deribit API Connected
-├ ✅ OpenAI GPT-4o mini Ready
-├ ✅ Redis OI Tracking Active
-└ ✅ Telegram Bot Online
-
-🚀 First scan will start in 10 seconds...
-"""
-        
-        try:
-            await context.bot.send_message(
-                chat_id=CHAT_ID,
-                text=startup_message,
-                parse_mode='Markdown'
-            )
-            logger.info("✅ Startup alert sent to Telegram")
-        except Exception as e:
-            logger.error(f"❌ Failed to send startup alert: {e}")
-
-# Bot commands
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command"""
-    await update.message.reply_text(
-        "🤖 **Trading Bot Active!**\n\n"
-        "📊 **Tracking:** BTC & ETH (Deribit)\n"
-        "⏱ **Timeframes:** 30m, 1hr, 4hr (500 candles each)\n"
-        "🎯 **Max Trades:** 8 per day\n"
-        "📈 **Scan Interval:** Every 30 minutes\n\n"
-        "**Commands:**\n"
-        "/status - Check bot status\n"
-        "/scan - Manual scan now\n"
-        "/analyze BTC - Analyze specific symbol\n\n"
-        "🚀 Bot will automatically scan and alert on valid setups!",
-        parse_mode='Markdown'
-    )
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Status command"""
-    bot = context.bot_data.get('trading_bot')
-    if bot:
-        uptime = datetime.now() - bot.bot_start_time
-        hours = int(uptime.total_seconds() // 3600)
-        minutes = int((uptime.total_seconds() % 3600) // 60)
-        
-        await update.message.reply_text(
-            f"📊 **Bot Status:**\n\n"
-            f"✅ Active and Running\n"
-            f"⏰ Uptime: {hours}h {minutes}m\n"
-            f"📈 Trades Today: {bot.trade_count_today}/{MAX_TRADES_PER_DAY}\n"
-            f"⏱ Scan Interval: 30 minutes\n"
-            f"💾 Using Redis for OI tracking\n"
-            f"📊 Candles per TF: {CANDLE_COUNT}\n\n"
-            f"Next scan in ~30 mins",
-            parse_mode='Markdown'
-        )
-
-async def scan_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manual scan command"""
-    await update.message.reply_text("🔍 Starting manual scan...")
-    bot = context.bot_data.get('trading_bot')
-    if bot:
-        await bot.scan_markets(context)
-        await update.message.reply_text("✅ Scan complete!")
-
-async def analyze_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Analyze specific symbol"""
-    if not context.args:
-        await update.message.reply_text("Usage: /analyze BTC or /analyze ETH")
-        return
-    
-    symbol_input = context.args[0].upper()
-    symbol = f"{symbol_input}-PERPETUAL"
-    
-    if symbol not in SYMBOLS:
-        await update.message.reply_text(f"❌ Invalid symbol. Use: BTC or ETH")
-        return
-    
-    await update.message.reply_text(f"🔍 Analyzing {symbol}...")
-    
-    try:
-        analysis = TradeAnalyzer.analyze_setup(symbol)
-        
-        if not analysis.get('valid'):
-            await update.message.reply_text(f"❌ Cannot analyze {symbol}: {analysis.get('reason', 'Unknown error')}")
-            return
-        
-        ai_result = TradeAnalyzer.get_ai_analysis(analysis)
-        
-        # Add AI results for chart
-        analysis['trade_signal'] = ai_result['signal']
-        analysis['entry_price'] = ai_result.get('entry')
-        analysis['sl_price'] = ai_result.get('sl')
-        analysis['target_price'] = ai_result.get('target')
-        analysis['trade_type'] = ai_result.get('pattern', 'Analysis')
-        
-        # Generate chart
-        chart_buf = ChartGenerator.create_chart(analysis['df_30m'], analysis, symbol)
-        
-        # Prepare message
-        patterns_text = ", ".join([p['name'] for p in analysis['patterns']]) if analysis['patterns'] else "None"
-        
-        message = f"""📊 **{symbol} Analysis**
-
-💰 Price: ${analysis['current_price']:.2f}
-📈 Patterns: {patterns_text}
-📊 Volume: {analysis['volume_ratio']}x avg
-🔄 OI: {analysis['oi_trend']['trend']} ({analysis['oi_trend']['change']:+.1f}%)
-
-🤖 **AI Signal:** {ai_result['signal']}
-💡 {ai_result.get('reason', 'No reason provided')}
-"""
-        
-        await context.bot.send_photo(
-            chat_id=update.effective_chat.id,
-            photo=chart_buf,
-            caption=message,
-            parse_mode='Markdown'
-        )
-        
-    except Exception as e:
-        logger.error(f"❌ Error in analyze command: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Error analyzing {symbol}: {str(e)}")
-
-def main():
-    """Main function"""
-    logger.info("="*80)
-    logger.info("🚀 INITIALIZING CRYPTO TRADING BOT")
-    logger.info("="*80)
-    
-    # Validate environment variables
-    if not TELEGRAM_TOKEN or not OPENAI_API_KEY or not CHAT_ID:
-        logger.error("❌ Missing required environment variables!")
-        logger.error("Required: TELEGRAM_BOT_TOKEN, OPENAI_API_KEY, TELEGRAM_CHAT_ID")
-        return
-    
-    logger.info("✅ Environment variables validated")
-    
-    # Test Redis connection
-    try:
-        redis_client.ping()
-        logger.info("✅ Redis connected successfully")
-    except Exception as e:
-        logger.error(f"❌ Redis connection failed: {e}")
-        logger.warning("⚠️ Bot will continue but OI tracking may not work properly")
-    
-    # Initialize bot
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    trading_bot = TradingBot()
-    application.bot_data['trading_bot'] = trading_bot
-    
-    logger.info("✅ Trading bot instance created")
-    
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("scan", scan_now))
-    application.add_handler(CommandHandler("analyze", analyze_symbol))
-    
-    logger.info("✅ Command handlers registered")
-    
-    # Schedule market scans every 30 mins
-    job_queue = application.job_queue
-    if job_queue:
-        job_queue.run_repeating(
-            trading_bot.scan_markets,
-            interval=1800,  # 30 minutes
-            first=10  # Start after 10 seconds
-        )
-        logger.info("✅ Job queue configured - scanning every 30 mins")
-        
-        # Schedule startup alert
-        job_queue.run_once(
-            trading_bot.send_startup_alert,
-            when=2  # Send after 2 seconds
-        )
-        logger.info("✅ Startup alert scheduled")
-    else:
-        logger.error("❌ Job queue not available!")
-    
-    # Start bot
-    logger.info("="*80)
-    logger.info("🚀 BOT STARTING...")
-    logger.info(f"📊 Tracking: {', '.join(SYMBOLS)}")
-    logger.info(f"⏱ Scan interval: 30 minutes")
-    logger.info(f"📈 Candles per TF: {CANDLE_COUNT}")
-    logger.info(f"🎯 Max trades per day: {MAX_TRADES_PER_DAY}")
-    logger.info("="*80)
-    
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == '__main__':
-    main(), '').replace(',', '')
+                        entry_str = entry_str.replace('$', '').replace(',', '')
                         result['entry'] = float(entry_str.split()[0])
                     except:
                         result['entry'] = analysis['current_price']
@@ -1094,397 +608,7 @@ if __name__ == '__main__':
                 elif 'SL:' in line or 'STOP' in line:
                     try:
                         sl_str = line.split(':')[-1].strip()
-                        sl_str = sl_str.replace('
-                
-                elif 'PATTERN:' in line:
-                    result['pattern'] = line.split('PATTERN:')[-1].strip()
-                
-                elif 'REASON:' in line:
-                    result['reason'] = line.split('REASON:')[-1].strip()
-            
-            # If no reason captured, use full response
-            if result['reason'] == 'No clear setup':
-                result['reason'] = ai_text
-            
-            logger.info(f"🎯 Parsed AI result: {result['signal']} - {result.get('pattern', 'No pattern')}")
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"❌ GPT API error for {analysis['symbol']}: {e}", exc_info=True)
-            return {
-                'signal': 'ERROR',
-                'reason': f'AI analysis failed: {str(e)}',
-                'entry': None,
-                'sl': None,
-                'target': None,
-                'pattern': 'Error'
-            }
-
-class TradingBot:
-    """Main bot logic"""
-    
-    def __init__(self):
-        self.trade_count_today = 0
-        self.last_reset = datetime.now().date()
-        self.bot_start_time = datetime.now()
-    
-    def reset_daily_counter(self):
-        """Reset trade counter at midnight"""
-        if datetime.now().date() > self.last_reset:
-            self.trade_count_today = 0
-            self.last_reset = datetime.now().date()
-            logger.info("🔄 Trade counter reset for new day")
-    
-    async def scan_markets(self, context: ContextTypes.DEFAULT_TYPE):
-        """Scan all symbols for setups - FIXED VERSION"""
-        logger.info(f"\n{'='*80}")
-        logger.info(f"🚀 STARTING MARKET SCAN - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        logger.info(f"{'='*80}")
-        
-        self.reset_daily_counter()
-        
-        if self.trade_count_today >= MAX_TRADES_PER_DAY:
-            logger.info(f"⛔ Daily limit reached: {self.trade_count_today}/{MAX_TRADES_PER_DAY}")
-            return
-        
-        for symbol in SYMBOLS:
-            try:
-                logger.info(f"\n📊 Scanning {symbol}...")
-                analysis = TradeAnalyzer.analyze_setup(symbol)
-                
-                # Check if data fetch failed
-                if not analysis or not analysis.get('valid'):
-                    logger.warning(f"⚠️ {symbol}: Invalid data, skipping")
-                    continue
-                
-                logger.info(f"💵 {symbol}: Price=${analysis['current_price']:.2f}, Volume={analysis['volume_ratio']}x, Patterns={len(analysis.get('patterns', []))}")
-                
-                # RELAXED FILTERS - Allow more setups to reach AI
-                patterns = analysis.get('patterns', [])
-                volume_ratio = analysis.get('volume_ratio', 0)
-                
-                # Change 1: Lower volume threshold to 1.2x
-                if volume_ratio < 1.2:
-                    logger.info(f"❌ {symbol}: Volume too low ({volume_ratio}x < 1.2x)")
-                    continue
-                
-                # Change 2: Allow if either patterns exist OR volume is high
-                if len(patterns) == 0 and volume_ratio < 2.0:
-                    logger.info(f"❌ {symbol}: No patterns and volume not exceptional")
-                    continue
-                
-                logger.info(f"✅ {symbol}: Passed filters, sending to AI analysis...")
-                
-                # Get AI analysis
-                ai_result = TradeAnalyzer.get_ai_analysis(analysis)
-                
-                logger.info(f"🎯 {symbol}: AI Signal = {ai_result['signal']}")
-                
-                # Check if valid signal
-                if ai_result['signal'] in ['LONG', 'SHORT']:
-                    self.trade_count_today += 1
-                    logger.info(f"🎉 {symbol}: VALID {ai_result['signal']} SIGNAL - Trade #{self.trade_count_today}")
-                    
-                    # Add AI results to analysis for chart
-                    analysis['trade_signal'] = ai_result['signal']
-                    analysis['entry_price'] = ai_result.get('entry')
-                    analysis['sl_price'] = ai_result.get('sl')
-                    analysis['target_price'] = ai_result.get('target')
-                    analysis['trade_type'] = ai_result.get('pattern', 'Breakout')
-                    
-                    await self.send_alert(context, symbol, analysis, ai_result)
-                else:
-                    logger.info(f"⏭️ {symbol}: {ai_result['signal']} - {ai_result.get('reason', '')[:80]}")
-                
-            except Exception as e:
-                logger.error(f"💥 Error scanning {symbol}: {e}", exc_info=True)
-            
-            await asyncio.sleep(3)  # Rate limit between symbols
-        
-        logger.info(f"\n{'='*80}")
-        logger.info(f"✅ SCAN COMPLETE - Trades today: {self.trade_count_today}/{MAX_TRADES_PER_DAY}")
-        logger.info(f"{'='*80}\n")
-    
-    async def send_alert(self, context: ContextTypes.DEFAULT_TYPE, symbol: str, analysis: Dict, ai_result: Dict):
-        """Send trade alert with chart to Telegram"""
-        
-        logger.info(f"📤 Sending alert for {symbol}...")
-        
-        # Generate chart
-        try:
-            chart_buf = ChartGenerator.create_chart(analysis['df_30m'], analysis, symbol)
-        except Exception as e:
-            logger.error(f"❌ Chart generation error: {e}")
-            chart_buf = None
-        
-        # Prepare text message
-        patterns_text = ", ".join([p['name'] for p in analysis['patterns'][:3]])
-        
-        oi_emoji = "📈" if "increasing" in analysis['oi_trend']['trend'] else "📉" if "decreasing" in analysis['oi_trend']['trend'] else "➡️"
-        signal_emoji = "🟢" if ai_result['signal'] == 'LONG' else "🔴"
-        
-        # Calculate R:R
-        try:
-            rr = abs((ai_result['target'] - ai_result['entry']) / (ai_result['entry'] - ai_result['sl']))
-        except:
-            rr = 0
-        
-        message = f"""{signal_emoji} **{analysis['symbol']} - {ai_result['signal']} SETUP**
-
-📊 **Pattern:** {ai_result['pattern']}
-💰 **Price:** ${analysis['current_price']:.2f}
-
-🎯 **TRADE DETAILS:**
-├ Entry: ${ai_result['entry']:.2f}
-├ Stop Loss: ${ai_result['sl']:.2f}
-├ Target: ${ai_result['target']:.2f}
-└ R:R = 1:{rr:.1f}
-
-✅ **CONFIRMATIONS:**
-├ Patterns: {patterns_text}
-├ Volume: {analysis['volume_ratio']}x avg
-└ OI: {oi_emoji} {analysis['oi_trend']['trend']} ({analysis['oi_trend']['change']:+.1f}%)
-
-📈 **SUPPORT & RESISTANCE:**
-├ 30m Support: ${analysis['swing_lows_30m'][-1]['price']:.2f if analysis['swing_lows_30m'] else 'N/A'}
-├ 30m Resistance: ${analysis['swing_highs_30m'][-1]['price']:.2f if analysis['swing_highs_30m'] else 'N/A'}
-├ 4H Support: ${analysis['support_4h']:.2f if analysis['support_4h'] else 'N/A'}
-└ 4H Resistance: ${analysis['resistance_4h']:.2f if analysis['resistance_4h'] else 'N/A'}
-
-💡 **Analysis:** {ai_result['reason']}
-
-⚠️ Trade #{self.trade_count_today}/{MAX_TRADES_PER_DAY} today
-"""
-        
-        try:
-            # Send chart first
-            if chart_buf:
-                await context.bot.send_photo(
-                    chat_id=CHAT_ID,
-                    photo=chart_buf,
-                    caption=message,
-                    parse_mode='Markdown'
-                )
-            else:
-                # If chart fails, send text only
-                await context.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=message,
-                    parse_mode='Markdown'
-                )
-            
-            logger.info(f"✅ Alert sent for {symbol}: {ai_result['signal']}")
-            
-        except Exception as e:
-            logger.error(f"❌ Error sending alert: {e}")
-    
-    async def send_startup_alert(self, context: ContextTypes.DEFAULT_TYPE):
-        """Send startup notification"""
-        startup_message = f"""🤖 **TRADING BOT STARTED**
-
-✅ Status: Online and Active
-🕐 Started: {self.bot_start_time.strftime('%Y-%m-%d %H:%M:%S')}
-
-📊 **Configuration:**
-├ Symbols: {', '.join(SYMBOLS)}
-├ Timeframes: 30m, 1h, 4h
-├ Candles per TF: {CANDLE_COUNT}
-├ Max Trades/Day: {MAX_TRADES_PER_DAY}
-└ Scan Interval: Every 30 minutes
-
-🔧 **Systems:**
-├ ✅ Deribit API Connected
-├ ✅ OpenAI GPT-4o mini Ready
-├ ✅ Redis OI Tracking Active
-└ ✅ Telegram Bot Online
-
-🚀 First scan will start in 10 seconds...
-"""
-        
-        try:
-            await context.bot.send_message(
-                chat_id=CHAT_ID,
-                text=startup_message,
-                parse_mode='Markdown'
-            )
-            logger.info("✅ Startup alert sent to Telegram")
-        except Exception as e:
-            logger.error(f"❌ Failed to send startup alert: {e}")
-
-# Bot commands
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command"""
-    await update.message.reply_text(
-        "🤖 **Trading Bot Active!**\n\n"
-        "📊 **Tracking:** BTC & ETH (Deribit)\n"
-        "⏱ **Timeframes:** 30m, 1hr, 4hr (500 candles each)\n"
-        "🎯 **Max Trades:** 8 per day\n"
-        "📈 **Scan Interval:** Every 30 minutes\n\n"
-        "**Commands:**\n"
-        "/status - Check bot status\n"
-        "/scan - Manual scan now\n"
-        "/analyze BTC - Analyze specific symbol\n\n"
-        "🚀 Bot will automatically scan and alert on valid setups!",
-        parse_mode='Markdown'
-    )
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Status command"""
-    bot = context.bot_data.get('trading_bot')
-    if bot:
-        uptime = datetime.now() - bot.bot_start_time
-        hours = int(uptime.total_seconds() // 3600)
-        minutes = int((uptime.total_seconds() % 3600) // 60)
-        
-        await update.message.reply_text(
-            f"📊 **Bot Status:**\n\n"
-            f"✅ Active and Running\n"
-            f"⏰ Uptime: {hours}h {minutes}m\n"
-            f"📈 Trades Today: {bot.trade_count_today}/{MAX_TRADES_PER_DAY}\n"
-            f"⏱ Scan Interval: 30 minutes\n"
-            f"💾 Using Redis for OI tracking\n"
-            f"📊 Candles per TF: {CANDLE_COUNT}\n\n"
-            f"Next scan in ~30 mins",
-            parse_mode='Markdown'
-        )
-
-async def scan_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manual scan command"""
-    await update.message.reply_text("🔍 Starting manual scan...")
-    bot = context.bot_data.get('trading_bot')
-    if bot:
-        await bot.scan_markets(context)
-        await update.message.reply_text("✅ Scan complete!")
-
-async def analyze_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Analyze specific symbol"""
-    if not context.args:
-        await update.message.reply_text("Usage: /analyze BTC or /analyze ETH")
-        return
-    
-    symbol_input = context.args[0].upper()
-    symbol = f"{symbol_input}-PERPETUAL"
-    
-    if symbol not in SYMBOLS:
-        await update.message.reply_text(f"❌ Invalid symbol. Use: BTC or ETH")
-        return
-    
-    await update.message.reply_text(f"🔍 Analyzing {symbol}...")
-    
-    try:
-        analysis = TradeAnalyzer.analyze_setup(symbol)
-        
-        if not analysis.get('valid'):
-            await update.message.reply_text(f"❌ Cannot analyze {symbol}: {analysis.get('reason', 'Unknown error')}")
-            return
-        
-        ai_result = TradeAnalyzer.get_ai_analysis(analysis)
-        
-        # Add AI results for chart
-        analysis['trade_signal'] = ai_result['signal']
-        analysis['entry_price'] = ai_result.get('entry')
-        analysis['sl_price'] = ai_result.get('sl')
-        analysis['target_price'] = ai_result.get('target')
-        analysis['trade_type'] = ai_result.get('pattern', 'Analysis')
-        
-        # Generate chart
-        chart_buf = ChartGenerator.create_chart(analysis['df_30m'], analysis, symbol)
-        
-        # Prepare message
-        patterns_text = ", ".join([p['name'] for p in analysis['patterns']]) if analysis['patterns'] else "None"
-        
-        message = f"""📊 **{symbol} Analysis**
-
-💰 Price: ${analysis['current_price']:.2f}
-📈 Patterns: {patterns_text}
-📊 Volume: {analysis['volume_ratio']}x avg
-🔄 OI: {analysis['oi_trend']['trend']} ({analysis['oi_trend']['change']:+.1f}%)
-
-🤖 **AI Signal:** {ai_result['signal']}
-💡 {ai_result.get('reason', 'No reason provided')}
-"""
-        
-        await context.bot.send_photo(
-            chat_id=update.effective_chat.id,
-            photo=chart_buf,
-            caption=message,
-            parse_mode='Markdown'
-        )
-        
-    except Exception as e:
-        logger.error(f"❌ Error in analyze command: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Error analyzing {symbol}: {str(e)}")
-
-def main():
-    """Main function"""
-    logger.info("="*80)
-    logger.info("🚀 INITIALIZING CRYPTO TRADING BOT")
-    logger.info("="*80)
-    
-    # Validate environment variables
-    if not TELEGRAM_TOKEN or not OPENAI_API_KEY or not CHAT_ID:
-        logger.error("❌ Missing required environment variables!")
-        logger.error("Required: TELEGRAM_BOT_TOKEN, OPENAI_API_KEY, TELEGRAM_CHAT_ID")
-        return
-    
-    logger.info("✅ Environment variables validated")
-    
-    # Test Redis connection
-    try:
-        redis_client.ping()
-        logger.info("✅ Redis connected successfully")
-    except Exception as e:
-        logger.error(f"❌ Redis connection failed: {e}")
-        logger.warning("⚠️ Bot will continue but OI tracking may not work properly")
-    
-    # Initialize bot
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    trading_bot = TradingBot()
-    application.bot_data['trading_bot'] = trading_bot
-    
-    logger.info("✅ Trading bot instance created")
-    
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("scan", scan_now))
-    application.add_handler(CommandHandler("analyze", analyze_symbol))
-    
-    logger.info("✅ Command handlers registered")
-    
-    # Schedule market scans every 30 mins
-    job_queue = application.job_queue
-    if job_queue:
-        job_queue.run_repeating(
-            trading_bot.scan_markets,
-            interval=1800,  # 30 minutes
-            first=10  # Start after 10 seconds
-        )
-        logger.info("✅ Job queue configured - scanning every 30 mins")
-        
-        # Schedule startup alert
-        job_queue.run_once(
-            trading_bot.send_startup_alert,
-            when=2  # Send after 2 seconds
-        )
-        logger.info("✅ Startup alert scheduled")
-    else:
-        logger.error("❌ Job queue not available!")
-    
-    # Start bot
-    logger.info("="*80)
-    logger.info("🚀 BOT STARTING...")
-    logger.info(f"📊 Tracking: {', '.join(SYMBOLS)}")
-    logger.info(f"⏱ Scan interval: 30 minutes")
-    logger.info(f"📈 Candles per TF: {CANDLE_COUNT}")
-    logger.info(f"🎯 Max trades per day: {MAX_TRADES_PER_DAY}")
-    logger.info("="*80)
-    
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == '__main__':
-    main(), '').replace(',', '')
+                        sl_str = sl_str.replace('$', '').replace(',', '')
                         result['sl'] = float(sl_str.split()[0])
                     except:
                         pass
@@ -1492,397 +616,7 @@ if __name__ == '__main__':
                 elif 'TARGET:' in line:
                     try:
                         tgt_str = line.split('TARGET:')[-1].strip()
-                        tgt_str = tgt_str.replace('
-                
-                elif 'PATTERN:' in line:
-                    result['pattern'] = line.split('PATTERN:')[-1].strip()
-                
-                elif 'REASON:' in line:
-                    result['reason'] = line.split('REASON:')[-1].strip()
-            
-            # If no reason captured, use full response
-            if result['reason'] == 'No clear setup':
-                result['reason'] = ai_text
-            
-            logger.info(f"🎯 Parsed AI result: {result['signal']} - {result.get('pattern', 'No pattern')}")
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"❌ GPT API error for {analysis['symbol']}: {e}", exc_info=True)
-            return {
-                'signal': 'ERROR',
-                'reason': f'AI analysis failed: {str(e)}',
-                'entry': None,
-                'sl': None,
-                'target': None,
-                'pattern': 'Error'
-            }
-
-class TradingBot:
-    """Main bot logic"""
-    
-    def __init__(self):
-        self.trade_count_today = 0
-        self.last_reset = datetime.now().date()
-        self.bot_start_time = datetime.now()
-    
-    def reset_daily_counter(self):
-        """Reset trade counter at midnight"""
-        if datetime.now().date() > self.last_reset:
-            self.trade_count_today = 0
-            self.last_reset = datetime.now().date()
-            logger.info("🔄 Trade counter reset for new day")
-    
-    async def scan_markets(self, context: ContextTypes.DEFAULT_TYPE):
-        """Scan all symbols for setups - FIXED VERSION"""
-        logger.info(f"\n{'='*80}")
-        logger.info(f"🚀 STARTING MARKET SCAN - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        logger.info(f"{'='*80}")
-        
-        self.reset_daily_counter()
-        
-        if self.trade_count_today >= MAX_TRADES_PER_DAY:
-            logger.info(f"⛔ Daily limit reached: {self.trade_count_today}/{MAX_TRADES_PER_DAY}")
-            return
-        
-        for symbol in SYMBOLS:
-            try:
-                logger.info(f"\n📊 Scanning {symbol}...")
-                analysis = TradeAnalyzer.analyze_setup(symbol)
-                
-                # Check if data fetch failed
-                if not analysis or not analysis.get('valid'):
-                    logger.warning(f"⚠️ {symbol}: Invalid data, skipping")
-                    continue
-                
-                logger.info(f"💵 {symbol}: Price=${analysis['current_price']:.2f}, Volume={analysis['volume_ratio']}x, Patterns={len(analysis.get('patterns', []))}")
-                
-                # RELAXED FILTERS - Allow more setups to reach AI
-                patterns = analysis.get('patterns', [])
-                volume_ratio = analysis.get('volume_ratio', 0)
-                
-                # Change 1: Lower volume threshold to 1.2x
-                if volume_ratio < 1.2:
-                    logger.info(f"❌ {symbol}: Volume too low ({volume_ratio}x < 1.2x)")
-                    continue
-                
-                # Change 2: Allow if either patterns exist OR volume is high
-                if len(patterns) == 0 and volume_ratio < 2.0:
-                    logger.info(f"❌ {symbol}: No patterns and volume not exceptional")
-                    continue
-                
-                logger.info(f"✅ {symbol}: Passed filters, sending to AI analysis...")
-                
-                # Get AI analysis
-                ai_result = TradeAnalyzer.get_ai_analysis(analysis)
-                
-                logger.info(f"🎯 {symbol}: AI Signal = {ai_result['signal']}")
-                
-                # Check if valid signal
-                if ai_result['signal'] in ['LONG', 'SHORT']:
-                    self.trade_count_today += 1
-                    logger.info(f"🎉 {symbol}: VALID {ai_result['signal']} SIGNAL - Trade #{self.trade_count_today}")
-                    
-                    # Add AI results to analysis for chart
-                    analysis['trade_signal'] = ai_result['signal']
-                    analysis['entry_price'] = ai_result.get('entry')
-                    analysis['sl_price'] = ai_result.get('sl')
-                    analysis['target_price'] = ai_result.get('target')
-                    analysis['trade_type'] = ai_result.get('pattern', 'Breakout')
-                    
-                    await self.send_alert(context, symbol, analysis, ai_result)
-                else:
-                    logger.info(f"⏭️ {symbol}: {ai_result['signal']} - {ai_result.get('reason', '')[:80]}")
-                
-            except Exception as e:
-                logger.error(f"💥 Error scanning {symbol}: {e}", exc_info=True)
-            
-            await asyncio.sleep(3)  # Rate limit between symbols
-        
-        logger.info(f"\n{'='*80}")
-        logger.info(f"✅ SCAN COMPLETE - Trades today: {self.trade_count_today}/{MAX_TRADES_PER_DAY}")
-        logger.info(f"{'='*80}\n")
-    
-    async def send_alert(self, context: ContextTypes.DEFAULT_TYPE, symbol: str, analysis: Dict, ai_result: Dict):
-        """Send trade alert with chart to Telegram"""
-        
-        logger.info(f"📤 Sending alert for {symbol}...")
-        
-        # Generate chart
-        try:
-            chart_buf = ChartGenerator.create_chart(analysis['df_30m'], analysis, symbol)
-        except Exception as e:
-            logger.error(f"❌ Chart generation error: {e}")
-            chart_buf = None
-        
-        # Prepare text message
-        patterns_text = ", ".join([p['name'] for p in analysis['patterns'][:3]])
-        
-        oi_emoji = "📈" if "increasing" in analysis['oi_trend']['trend'] else "📉" if "decreasing" in analysis['oi_trend']['trend'] else "➡️"
-        signal_emoji = "🟢" if ai_result['signal'] == 'LONG' else "🔴"
-        
-        # Calculate R:R
-        try:
-            rr = abs((ai_result['target'] - ai_result['entry']) / (ai_result['entry'] - ai_result['sl']))
-        except:
-            rr = 0
-        
-        message = f"""{signal_emoji} **{analysis['symbol']} - {ai_result['signal']} SETUP**
-
-📊 **Pattern:** {ai_result['pattern']}
-💰 **Price:** ${analysis['current_price']:.2f}
-
-🎯 **TRADE DETAILS:**
-├ Entry: ${ai_result['entry']:.2f}
-├ Stop Loss: ${ai_result['sl']:.2f}
-├ Target: ${ai_result['target']:.2f}
-└ R:R = 1:{rr:.1f}
-
-✅ **CONFIRMATIONS:**
-├ Patterns: {patterns_text}
-├ Volume: {analysis['volume_ratio']}x avg
-└ OI: {oi_emoji} {analysis['oi_trend']['trend']} ({analysis['oi_trend']['change']:+.1f}%)
-
-📈 **SUPPORT & RESISTANCE:**
-├ 30m Support: ${analysis['swing_lows_30m'][-1]['price']:.2f if analysis['swing_lows_30m'] else 'N/A'}
-├ 30m Resistance: ${analysis['swing_highs_30m'][-1]['price']:.2f if analysis['swing_highs_30m'] else 'N/A'}
-├ 4H Support: ${analysis['support_4h']:.2f if analysis['support_4h'] else 'N/A'}
-└ 4H Resistance: ${analysis['resistance_4h']:.2f if analysis['resistance_4h'] else 'N/A'}
-
-💡 **Analysis:** {ai_result['reason']}
-
-⚠️ Trade #{self.trade_count_today}/{MAX_TRADES_PER_DAY} today
-"""
-        
-        try:
-            # Send chart first
-            if chart_buf:
-                await context.bot.send_photo(
-                    chat_id=CHAT_ID,
-                    photo=chart_buf,
-                    caption=message,
-                    parse_mode='Markdown'
-                )
-            else:
-                # If chart fails, send text only
-                await context.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=message,
-                    parse_mode='Markdown'
-                )
-            
-            logger.info(f"✅ Alert sent for {symbol}: {ai_result['signal']}")
-            
-        except Exception as e:
-            logger.error(f"❌ Error sending alert: {e}")
-    
-    async def send_startup_alert(self, context: ContextTypes.DEFAULT_TYPE):
-        """Send startup notification"""
-        startup_message = f"""🤖 **TRADING BOT STARTED**
-
-✅ Status: Online and Active
-🕐 Started: {self.bot_start_time.strftime('%Y-%m-%d %H:%M:%S')}
-
-📊 **Configuration:**
-├ Symbols: {', '.join(SYMBOLS)}
-├ Timeframes: 30m, 1h, 4h
-├ Candles per TF: {CANDLE_COUNT}
-├ Max Trades/Day: {MAX_TRADES_PER_DAY}
-└ Scan Interval: Every 30 minutes
-
-🔧 **Systems:**
-├ ✅ Deribit API Connected
-├ ✅ OpenAI GPT-4o mini Ready
-├ ✅ Redis OI Tracking Active
-└ ✅ Telegram Bot Online
-
-🚀 First scan will start in 10 seconds...
-"""
-        
-        try:
-            await context.bot.send_message(
-                chat_id=CHAT_ID,
-                text=startup_message,
-                parse_mode='Markdown'
-            )
-            logger.info("✅ Startup alert sent to Telegram")
-        except Exception as e:
-            logger.error(f"❌ Failed to send startup alert: {e}")
-
-# Bot commands
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command"""
-    await update.message.reply_text(
-        "🤖 **Trading Bot Active!**\n\n"
-        "📊 **Tracking:** BTC & ETH (Deribit)\n"
-        "⏱ **Timeframes:** 30m, 1hr, 4hr (500 candles each)\n"
-        "🎯 **Max Trades:** 8 per day\n"
-        "📈 **Scan Interval:** Every 30 minutes\n\n"
-        "**Commands:**\n"
-        "/status - Check bot status\n"
-        "/scan - Manual scan now\n"
-        "/analyze BTC - Analyze specific symbol\n\n"
-        "🚀 Bot will automatically scan and alert on valid setups!",
-        parse_mode='Markdown'
-    )
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Status command"""
-    bot = context.bot_data.get('trading_bot')
-    if bot:
-        uptime = datetime.now() - bot.bot_start_time
-        hours = int(uptime.total_seconds() // 3600)
-        minutes = int((uptime.total_seconds() % 3600) // 60)
-        
-        await update.message.reply_text(
-            f"📊 **Bot Status:**\n\n"
-            f"✅ Active and Running\n"
-            f"⏰ Uptime: {hours}h {minutes}m\n"
-            f"📈 Trades Today: {bot.trade_count_today}/{MAX_TRADES_PER_DAY}\n"
-            f"⏱ Scan Interval: 30 minutes\n"
-            f"💾 Using Redis for OI tracking\n"
-            f"📊 Candles per TF: {CANDLE_COUNT}\n\n"
-            f"Next scan in ~30 mins",
-            parse_mode='Markdown'
-        )
-
-async def scan_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manual scan command"""
-    await update.message.reply_text("🔍 Starting manual scan...")
-    bot = context.bot_data.get('trading_bot')
-    if bot:
-        await bot.scan_markets(context)
-        await update.message.reply_text("✅ Scan complete!")
-
-async def analyze_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Analyze specific symbol"""
-    if not context.args:
-        await update.message.reply_text("Usage: /analyze BTC or /analyze ETH")
-        return
-    
-    symbol_input = context.args[0].upper()
-    symbol = f"{symbol_input}-PERPETUAL"
-    
-    if symbol not in SYMBOLS:
-        await update.message.reply_text(f"❌ Invalid symbol. Use: BTC or ETH")
-        return
-    
-    await update.message.reply_text(f"🔍 Analyzing {symbol}...")
-    
-    try:
-        analysis = TradeAnalyzer.analyze_setup(symbol)
-        
-        if not analysis.get('valid'):
-            await update.message.reply_text(f"❌ Cannot analyze {symbol}: {analysis.get('reason', 'Unknown error')}")
-            return
-        
-        ai_result = TradeAnalyzer.get_ai_analysis(analysis)
-        
-        # Add AI results for chart
-        analysis['trade_signal'] = ai_result['signal']
-        analysis['entry_price'] = ai_result.get('entry')
-        analysis['sl_price'] = ai_result.get('sl')
-        analysis['target_price'] = ai_result.get('target')
-        analysis['trade_type'] = ai_result.get('pattern', 'Analysis')
-        
-        # Generate chart
-        chart_buf = ChartGenerator.create_chart(analysis['df_30m'], analysis, symbol)
-        
-        # Prepare message
-        patterns_text = ", ".join([p['name'] for p in analysis['patterns']]) if analysis['patterns'] else "None"
-        
-        message = f"""📊 **{symbol} Analysis**
-
-💰 Price: ${analysis['current_price']:.2f}
-📈 Patterns: {patterns_text}
-📊 Volume: {analysis['volume_ratio']}x avg
-🔄 OI: {analysis['oi_trend']['trend']} ({analysis['oi_trend']['change']:+.1f}%)
-
-🤖 **AI Signal:** {ai_result['signal']}
-💡 {ai_result.get('reason', 'No reason provided')}
-"""
-        
-        await context.bot.send_photo(
-            chat_id=update.effective_chat.id,
-            photo=chart_buf,
-            caption=message,
-            parse_mode='Markdown'
-        )
-        
-    except Exception as e:
-        logger.error(f"❌ Error in analyze command: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Error analyzing {symbol}: {str(e)}")
-
-def main():
-    """Main function"""
-    logger.info("="*80)
-    logger.info("🚀 INITIALIZING CRYPTO TRADING BOT")
-    logger.info("="*80)
-    
-    # Validate environment variables
-    if not TELEGRAM_TOKEN or not OPENAI_API_KEY or not CHAT_ID:
-        logger.error("❌ Missing required environment variables!")
-        logger.error("Required: TELEGRAM_BOT_TOKEN, OPENAI_API_KEY, TELEGRAM_CHAT_ID")
-        return
-    
-    logger.info("✅ Environment variables validated")
-    
-    # Test Redis connection
-    try:
-        redis_client.ping()
-        logger.info("✅ Redis connected successfully")
-    except Exception as e:
-        logger.error(f"❌ Redis connection failed: {e}")
-        logger.warning("⚠️ Bot will continue but OI tracking may not work properly")
-    
-    # Initialize bot
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    trading_bot = TradingBot()
-    application.bot_data['trading_bot'] = trading_bot
-    
-    logger.info("✅ Trading bot instance created")
-    
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("scan", scan_now))
-    application.add_handler(CommandHandler("analyze", analyze_symbol))
-    
-    logger.info("✅ Command handlers registered")
-    
-    # Schedule market scans every 30 mins
-    job_queue = application.job_queue
-    if job_queue:
-        job_queue.run_repeating(
-            trading_bot.scan_markets,
-            interval=1800,  # 30 minutes
-            first=10  # Start after 10 seconds
-        )
-        logger.info("✅ Job queue configured - scanning every 30 mins")
-        
-        # Schedule startup alert
-        job_queue.run_once(
-            trading_bot.send_startup_alert,
-            when=2  # Send after 2 seconds
-        )
-        logger.info("✅ Startup alert scheduled")
-    else:
-        logger.error("❌ Job queue not available!")
-    
-    # Start bot
-    logger.info("="*80)
-    logger.info("🚀 BOT STARTING...")
-    logger.info(f"📊 Tracking: {', '.join(SYMBOLS)}")
-    logger.info(f"⏱ Scan interval: 30 minutes")
-    logger.info(f"📈 Candles per TF: {CANDLE_COUNT}")
-    logger.info(f"🎯 Max trades per day: {MAX_TRADES_PER_DAY}")
-    logger.info("="*80)
-    
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == '__main__':
-    main(), '').replace(',', '')
+                        tgt_str = tgt_str.replace('$', '').replace(',', '')
                         result['target'] = float(tgt_str.split()[0])
                     except:
                         pass
@@ -1893,7 +627,6 @@ if __name__ == '__main__':
                 elif 'REASON:' in line:
                     result['reason'] = line.split('REASON:')[-1].strip()
             
-            # If no reason captured, use full response
             if result['reason'] == 'No clear setup':
                 result['reason'] = ai_text
             
@@ -1928,7 +661,7 @@ class TradingBot:
             logger.info("🔄 Trade counter reset for new day")
     
     async def scan_markets(self, context: ContextTypes.DEFAULT_TYPE):
-        """Scan all symbols for setups - FIXED VERSION"""
+        """Scan all symbols for setups"""
         logger.info(f"\n{'='*80}")
         logger.info(f"🚀 STARTING MARKET SCAN - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info(f"{'='*80}")
@@ -1944,40 +677,33 @@ class TradingBot:
                 logger.info(f"\n📊 Scanning {symbol}...")
                 analysis = TradeAnalyzer.analyze_setup(symbol)
                 
-                # Check if data fetch failed
                 if not analysis or not analysis.get('valid'):
                     logger.warning(f"⚠️ {symbol}: Invalid data, skipping")
                     continue
                 
                 logger.info(f"💵 {symbol}: Price=${analysis['current_price']:.2f}, Volume={analysis['volume_ratio']}x, Patterns={len(analysis.get('patterns', []))}")
                 
-                # RELAXED FILTERS - Allow more setups to reach AI
                 patterns = analysis.get('patterns', [])
                 volume_ratio = analysis.get('volume_ratio', 0)
                 
-                # Change 1: Lower volume threshold to 1.2x
                 if volume_ratio < 1.2:
                     logger.info(f"❌ {symbol}: Volume too low ({volume_ratio}x < 1.2x)")
                     continue
                 
-                # Change 2: Allow if either patterns exist OR volume is high
                 if len(patterns) == 0 and volume_ratio < 2.0:
                     logger.info(f"❌ {symbol}: No patterns and volume not exceptional")
                     continue
                 
                 logger.info(f"✅ {symbol}: Passed filters, sending to AI analysis...")
                 
-                # Get AI analysis
                 ai_result = TradeAnalyzer.get_ai_analysis(analysis)
                 
                 logger.info(f"🎯 {symbol}: AI Signal = {ai_result['signal']}")
                 
-                # Check if valid signal
                 if ai_result['signal'] in ['LONG', 'SHORT']:
                     self.trade_count_today += 1
                     logger.info(f"🎉 {symbol}: VALID {ai_result['signal']} SIGNAL - Trade #{self.trade_count_today}")
                     
-                    # Add AI results to analysis for chart
                     analysis['trade_signal'] = ai_result['signal']
                     analysis['entry_price'] = ai_result.get('entry')
                     analysis['sl_price'] = ai_result.get('sl')
@@ -1991,7 +717,7 @@ class TradingBot:
             except Exception as e:
                 logger.error(f"💥 Error scanning {symbol}: {e}", exc_info=True)
             
-            await asyncio.sleep(3)  # Rate limit between symbols
+            await asyncio.sleep(3)
         
         logger.info(f"\n{'='*80}")
         logger.info(f"✅ SCAN COMPLETE - Trades today: {self.trade_count_today}/{MAX_TRADES_PER_DAY}")
@@ -2002,20 +728,17 @@ class TradingBot:
         
         logger.info(f"📤 Sending alert for {symbol}...")
         
-        # Generate chart
         try:
             chart_buf = ChartGenerator.create_chart(analysis['df_30m'], analysis, symbol)
         except Exception as e:
             logger.error(f"❌ Chart generation error: {e}")
             chart_buf = None
         
-        # Prepare text message
         patterns_text = ", ".join([p['name'] for p in analysis['patterns'][:3]])
         
         oi_emoji = "📈" if "increasing" in analysis['oi_trend']['trend'] else "📉" if "decreasing" in analysis['oi_trend']['trend'] else "➡️"
         signal_emoji = "🟢" if ai_result['signal'] == 'LONG' else "🔴"
         
-        # Calculate R:R
         try:
             rr = abs((ai_result['target'] - ai_result['entry']) / (ai_result['entry'] - ai_result['sl']))
         except:
@@ -2049,7 +772,6 @@ class TradingBot:
 """
         
         try:
-            # Send chart first
             if chart_buf:
                 await context.bot.send_photo(
                     chat_id=CHAT_ID,
@@ -2058,7 +780,6 @@ class TradingBot:
                     parse_mode='Markdown'
                 )
             else:
-                # If chart fails, send text only
                 await context.bot.send_message(
                     chat_id=CHAT_ID,
                     text=message,
@@ -2103,7 +824,6 @@ class TradingBot:
         except Exception as e:
             logger.error(f"❌ Failed to send startup alert: {e}")
 
-# Bot commands
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command"""
     await update.message.reply_text(
@@ -2172,17 +892,14 @@ async def analyze_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         ai_result = TradeAnalyzer.get_ai_analysis(analysis)
         
-        # Add AI results for chart
         analysis['trade_signal'] = ai_result['signal']
         analysis['entry_price'] = ai_result.get('entry')
         analysis['sl_price'] = ai_result.get('sl')
         analysis['target_price'] = ai_result.get('target')
         analysis['trade_type'] = ai_result.get('pattern', 'Analysis')
         
-        # Generate chart
         chart_buf = ChartGenerator.create_chart(analysis['df_30m'], analysis, symbol)
         
-        # Prepare message
         patterns_text = ", ".join([p['name'] for p in analysis['patterns']]) if analysis['patterns'] else "None"
         
         message = f"""📊 **{symbol} Analysis**
@@ -2213,7 +930,6 @@ def main():
     logger.info("🚀 INITIALIZING CRYPTO TRADING BOT")
     logger.info("="*80)
     
-    # Validate environment variables
     if not TELEGRAM_TOKEN or not OPENAI_API_KEY or not CHAT_ID:
         logger.error("❌ Missing required environment variables!")
         logger.error("Required: TELEGRAM_BOT_TOKEN, OPENAI_API_KEY, TELEGRAM_CHAT_ID")
@@ -2221,7 +937,6 @@ def main():
     
     logger.info("✅ Environment variables validated")
     
-    # Test Redis connection
     try:
         redis_client.ping()
         logger.info("✅ Redis connected successfully")
@@ -2229,14 +944,12 @@ def main():
         logger.error(f"❌ Redis connection failed: {e}")
         logger.warning("⚠️ Bot will continue but OI tracking may not work properly")
     
-    # Initialize bot
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     trading_bot = TradingBot()
     application.bot_data['trading_bot'] = trading_bot
     
     logger.info("✅ Trading bot instance created")
     
-    # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("scan", scan_now))
@@ -2244,26 +957,23 @@ def main():
     
     logger.info("✅ Command handlers registered")
     
-    # Schedule market scans every 30 mins
     job_queue = application.job_queue
     if job_queue:
         job_queue.run_repeating(
             trading_bot.scan_markets,
-            interval=1800,  # 30 minutes
-            first=10  # Start after 10 seconds
+            interval=1800,
+            first=10
         )
         logger.info("✅ Job queue configured - scanning every 30 mins")
         
-        # Schedule startup alert
         job_queue.run_once(
             trading_bot.send_startup_alert,
-            when=2  # Send after 2 seconds
+            when=2
         )
         logger.info("✅ Startup alert scheduled")
     else:
         logger.error("❌ Job queue not available!")
     
-    # Start bot
     logger.info("="*80)
     logger.info("🚀 BOT STARTING...")
     logger.info(f"📊 Tracking: {', '.join(SYMBOLS)}")
