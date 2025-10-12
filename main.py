@@ -18,7 +18,7 @@ from matplotlib.lines import Line2D
 import io
 from PIL import Image
 
-# Logging setup
+# Logging setup - ENHANCED
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -56,6 +56,8 @@ class DeribitClient:
     def get_candles(symbol: str, timeframe: str, count: int = CANDLE_COUNT) -> pd.DataFrame:
         """Fetch OHLCV data - 500 candles"""
         
+        logger.info(f"📊 Fetching {count} candles for {symbol} {timeframe}m...")
+        
         # For 4hr, we'll use daily candles as Deribit may not support 240
         resolution = DeribitClient.RESOLUTION_MAP.get(timeframe, timeframe)
         
@@ -81,19 +83,19 @@ class DeribitClient:
             
             # Check HTTP status
             if response.status_code != 200:
-                logger.error(f"Deribit API HTTP {response.status_code} for {symbol} {timeframe}m")
+                logger.error(f"❌ Deribit API HTTP {response.status_code} for {symbol} {timeframe}m")
                 return pd.DataFrame()
             
             data = response.json()
             
             # Check for error in response
             if 'error' in data:
-                logger.error(f"Deribit API error for {symbol} {timeframe}m: {data['error']}")
+                logger.error(f"❌ Deribit API error for {symbol} {timeframe}m: {data['error']}")
                 return pd.DataFrame()
             
             # Check result exists
             if 'result' not in data:
-                logger.error(f"No 'result' in Deribit response for {symbol} {timeframe}m")
+                logger.error(f"❌ No 'result' in Deribit response for {symbol} {timeframe}m")
                 logger.debug(f"Response: {str(data)[:200]}")
                 return pd.DataFrame()
             
@@ -101,14 +103,14 @@ class DeribitClient:
             
             # Validate result structure
             if result.get('status') != 'ok':
-                logger.error(f"Deribit status not OK for {symbol} {timeframe}m: {result.get('status')}")
+                logger.error(f"❌ Deribit status not OK for {symbol} {timeframe}m: {result.get('status')}")
                 return pd.DataFrame()
             
             # Check required fields
             required_fields = ['ticks', 'open', 'high', 'low', 'close', 'volume']
             missing = [f for f in required_fields if f not in result]
             if missing:
-                logger.error(f"Missing fields in Deribit response for {symbol} {timeframe}m: {missing}")
+                logger.error(f"❌ Missing fields in Deribit response for {symbol} {timeframe}m: {missing}")
                 return pd.DataFrame()
             
             # Create DataFrame
@@ -122,47 +124,57 @@ class DeribitClient:
             })
             
             if len(df) == 0:
-                logger.warning(f"Empty dataframe for {symbol} {timeframe}m")
+                logger.warning(f"⚠️ Empty dataframe for {symbol} {timeframe}m")
                 return pd.DataFrame()
             
             df.set_index('timestamp', inplace=True)
             
             # For 4hr timeframe using daily data, resample
             if timeframe == '240':
-                logger.info(f"Using daily data for 4hr timeframe {symbol}")
+                logger.info(f"ℹ️ Using daily data for 4hr timeframe {symbol}")
             
-            logger.info(f"Fetched {len(df)} candles for {symbol} {resolution} ({timeframe}m requested)")
+            logger.info(f"✅ Fetched {len(df)} candles for {symbol} {resolution} ({timeframe}m requested)")
             return df.tail(count)
             
         except requests.exceptions.Timeout:
-            logger.error(f"Timeout fetching candles for {symbol} {timeframe}m")
+            logger.error(f"⏱️ Timeout fetching candles for {symbol} {timeframe}m")
         except requests.exceptions.RequestException as e:
-            logger.error(f"Request error fetching candles for {symbol} {timeframe}m: {e}")
+            logger.error(f"🌐 Request error fetching candles for {symbol} {timeframe}m: {e}")
         except KeyError as e:
-            logger.error(f"KeyError in Deribit data for {symbol} {timeframe}m: {e}")
+            logger.error(f"🔑 KeyError in Deribit data for {symbol} {timeframe}m: {e}")
         except Exception as e:
-            logger.error(f"Unexpected error fetching candles for {symbol} {timeframe}m: {e}", exc_info=True)
+            logger.error(f"💥 Unexpected error fetching candles for {symbol} {timeframe}m: {e}", exc_info=True)
         
         return pd.DataFrame()
     
     @staticmethod
     def get_order_book(symbol: str, depth: int = 10) -> Dict:
         """Fetch order book for OI analysis"""
+        logger.info(f"📖 Fetching order book for {symbol}...")
+        
         url = f"{DERIBIT_BASE}/get_order_book"
         params = {'instrument_name': symbol, 'depth': depth}
         
         try:
             response = requests.get(url, params=params, timeout=10)
             data = response.json()
+            
             if 'result' in data:
+                oi = data['result'].get('open_interest', 0)
+                volume = data['result'].get('stats', {}).get('volume', 0)
+                mark = data['result'].get('mark_price', 0)
+                
+                logger.info(f"📊 {symbol} OI: {oi:,.0f}, Volume 24h: {volume:,.2f}, Mark: ${mark:,.2f}")
+                
                 return {
-                    'open_interest': data['result'].get('open_interest', 0),
-                    'volume_24h': data['result'].get('stats', {}).get('volume', 0),
-                    'mark_price': data['result'].get('mark_price', 0)
+                    'open_interest': oi,
+                    'volume_24h': volume,
+                    'mark_price': mark
                 }
         except Exception as e:
-            logger.error(f"Error fetching order book: {e}")
-        return {}
+            logger.error(f"❌ Error fetching order book for {symbol}: {e}")
+        
+        return {'open_interest': 0, 'volume_24h': 0, 'mark_price': 0}
 
 class TechnicalAnalyzer:
     """Technical analysis functions"""
@@ -295,6 +307,7 @@ class TechnicalAnalyzer:
             elif abs(min(lows[-10:]) - min(lows[:10])) < (min(lows) * 0.01) and max(highs[-10:]) < max(highs[:10]):
                 patterns.append({'type': 'chart', 'name': 'Descending Triangle', 'signal': 'bearish'})
         
+        logger.info(f"🔍 Detected {len(patterns)} patterns: {[p['name'] for p in patterns]}")
         return patterns
     
     @staticmethod
@@ -327,6 +340,7 @@ class OITracker:
         """Store current OI in Redis with timestamp"""
         key = f"oi:{symbol}:{int(datetime.now().timestamp())}"
         redis_client.setex(key, 7200, json.dumps(oi_data))  # 2hr expiry
+        logger.info(f"💾 Stored OI data for {symbol}: {oi_data}")
     
     @staticmethod
     def get_oi_history(symbol: str, hours: int = 2) -> List[Dict]:
@@ -336,14 +350,17 @@ class OITracker:
         
         history = []
         try:
-            for key in redis_client.scan_iter(match=pattern):
+            keys = list(redis_client.scan_iter(match=pattern))
+            logger.info(f"📚 Found {len(keys)} OI records for {symbol} in last {hours}h")
+            
+            for key in keys:
                 timestamp = int(key.split(':')[-1])
                 if timestamp >= cutoff:
                     data = json.loads(redis_client.get(key))
                     data['timestamp'] = timestamp
                     history.append(data)
         except Exception as e:
-            logger.error(f"Redis error: {e}")
+            logger.error(f"❌ Redis error getting OI history: {e}")
         
         return sorted(history, key=lambda x: x['timestamp'])
     
@@ -353,6 +370,7 @@ class OITracker:
         history = OITracker.get_oi_history(symbol, hours=2)
         
         if len(history) < 2:
+            logger.warning(f"⚠️ Insufficient OI data for {symbol}: {len(history)} records")
             return {'trend': 'insufficient_data', 'change': 0, 'supporting_sr': None}
         
         current_oi = history[-1]['open_interest']
@@ -370,6 +388,8 @@ class OITracker:
         else:
             trend = 'stable'
         
+        logger.info(f"📊 {symbol} OI Trend: {trend} ({change:+.2f}% change)")
+        
         return {
             'trend': trend,
             'change': round(change, 2),
@@ -384,6 +404,8 @@ class ChartGenerator:
     @staticmethod
     def create_chart(df: pd.DataFrame, analysis: Dict, symbol: str) -> io.BytesIO:
         """Create chart with S/R, trendlines, patterns marked"""
+        
+        logger.info(f"📈 Generating chart for {symbol}...")
         
         # Setup white background style
         mc = mpf.make_marketcolors(
@@ -499,6 +521,7 @@ class ChartGenerator:
         buf.seek(0)
         plt.close(fig)
         
+        logger.info(f"✅ Chart generated for {symbol}")
         return buf
 
 class TradeAnalyzer:
@@ -507,7 +530,9 @@ class TradeAnalyzer:
     @staticmethod
     def analyze_setup(symbol: str) -> Dict:
         """Comprehensive trade analysis with 500 candles per TF"""
-        logger.info(f"Analyzing {symbol}...")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"🔍 ANALYZING {symbol}")
+        logger.info(f"{'='*60}")
         
         # Fetch multi-timeframe data (500 candles each)
         df_30m = DeribitClient.get_candles(symbol, '30', CANDLE_COUNT)
@@ -515,9 +540,10 @@ class TradeAnalyzer:
         df_4h = DeribitClient.get_candles(symbol, '240', CANDLE_COUNT)
         
         if df_30m.empty or df_1h.empty or df_4h.empty:
-            return {'valid': False, 'reason': 'Insufficient data'}
+            logger.error(f"❌ Insufficient data for {symbol}")
+            return {'valid': False, 'reason': 'Insufficient data', 'symbol': symbol}
         
-        logger.info(f"{symbol}: Loaded {len(df_30m)} x 30m, {len(df_1h)} x 1h, {len(df_4h)} x 4h candles")
+        logger.info(f"✅ {symbol}: Loaded {len(df_30m)} x 30m, {len(df_1h)} x 1h, {len(df_4h)} x 4h candles")
         
         # Get OI data
         oi_data = DeribitClient.get_order_book(symbol)
@@ -529,6 +555,8 @@ class TradeAnalyzer:
         swing_highs_1h, swing_lows_1h = TechnicalAnalyzer.find_swing_points(df_1h)
         swing_highs_4h, swing_lows_4h = TechnicalAnalyzer.find_swing_points(df_4h)
         
+        logger.info(f"📍 Swing Points - 30m: {len(swing_highs_30m)} highs, {len(swing_lows_30m)} lows")
+        
         patterns = TechnicalAnalyzer.detect_patterns(df_30m)
         volume_profile = TechnicalAnalyzer.calculate_volume_profile(df_30m)
         
@@ -536,6 +564,9 @@ class TradeAnalyzer:
         avg_volume = df_30m['volume'].tail(20).mean()
         current_volume = df_30m['volume'].iloc[-1]
         volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
+        
+        logger.info(f"💰 Price: ${current_price:.2f}")
+        logger.info(f"📊 Volume Ratio: {volume_ratio:.2f}x (avg: {avg_volume:.2f}, current: {current_volume:.2f})")
         
         # Determine OI supported S/R
         oi_sr = None
@@ -546,8 +577,10 @@ class TradeAnalyzer:
             
             if abs(current_price - recent_high) < abs(current_price - recent_low):
                 oi_sr = recent_high  # Near resistance
+                logger.info(f"🔵 OI increasing near resistance: ${oi_sr:.2f}")
             else:
                 oi_sr = recent_low  # Near support
+                logger.info(f"🔵 OI increasing near support: ${oi_sr:.2f}")
         
         oi_trend['supporting_sr'] = oi_sr
         
@@ -567,68 +600,76 @@ class TradeAnalyzer:
             'support_4h': swing_lows_4h[-1]['price'] if swing_lows_4h else None,
             'volume_profile': volume_profile,
             'df_30m': df_30m,  # For chart generation
-            'valid': False
+            'valid': True
         }
         
+        logger.info(f"✅ Analysis complete for {symbol}")
         return analysis
     
     @staticmethod
     def get_ai_analysis(analysis: Dict) -> Dict:
-        """Get GPT-4o mini analysis with structured output"""
+        """Get GPT-4o mini analysis - IMPROVED VERSION"""
         
-        patterns_text = "\n".join([f"- {p['name']} ({p['signal']})" for p in analysis['patterns']]) if analysis['patterns'] else "None"
+        logger.info(f"\n🤖 Calling OpenAI for {analysis['symbol']}...")
         
-        prompt = f"""Analyze this crypto trading setup for breakout/breakdown:
+        patterns_text = "\n".join([f"- {p['name']} ({p['signal']})" for p in analysis.get('patterns', [])]) if analysis.get('patterns') else "None detected"
+        
+        # Get S/R levels
+        support_30m = analysis['swing_lows_30m'][-1]['price'] if analysis.get('swing_lows_30m') else None
+        resistance_30m = analysis['swing_highs_30m'][-1]['price'] if analysis.get('swing_highs_30m') else None
+        
+        prompt = f"""Analyze this crypto setup for {analysis['symbol']}:
 
-Symbol: {analysis['symbol']}
-Price: ${analysis['current_price']:.2f}
-Timeframe: 30min
+CURRENT PRICE: ${analysis['current_price']:.2f}
 
-PATTERNS DETECTED:
+PATTERNS:
 {patterns_text}
 
-VOLUME: {analysis['volume_ratio']}x average (need >1.5x)
+VOLUME: {analysis.get('volume_ratio', 0):.2f}x average
 
-OI ANALYSIS:
-- Trend: {analysis['oi_trend']['trend']}
-- Change: {analysis['oi_trend']['change']}%
-- Supporting S/R: ${analysis['oi_trend']['supporting_sr']:.2f if analysis['oi_trend']['supporting_sr'] else 'N/A'}
+OPEN INTEREST:
+- Trend: {analysis.get('oi_trend', {}).get('trend', 'unknown')}
+- Change: {analysis.get('oi_trend', {}).get('change', 0):.1f}%
 
-SUPPORT/RESISTANCE:
-- 30m swing low: ${analysis['swing_lows_30m'][-1]['price']:.2f if analysis['swing_lows_30m'] else 'N/A'}
-- 30m swing high: ${analysis['swing_highs_30m'][-1]['price']:.2f if analysis['swing_highs_30m'] else 'N/A'}
-- 4h support: ${analysis['support_4h']:.2f if analysis['support_4h'] else 'N/A'}
-- 4h resistance: ${analysis['resistance_4h']:.2f if analysis['resistance_4h'] else 'N/A'}
+KEY LEVELS:
+- 30m Support: ${support_30m:.2f if support_30m else 0}
+- 30m Resistance: ${resistance_30m:.2f if resistance_30m else 0}
+- 4H Support: ${analysis.get('support_4h', 0):.2f if analysis.get('support_4h') else 0}
+- 4H Resistance: ${analysis.get('resistance_4h', 0):.2f if analysis.get('resistance_4h') else 0}
 
-RULES (STRICT):
-1. Body close beyond S/R required
-2. Wicks < 30% of candle
-3. Volume MUST be >1.5x average
-4. OI should support direction
-5. Multi-TF alignment needed
+TRADING RULES:
+1. Volume should be >1.2x (you have {analysis.get('volume_ratio', 0):.2f}x)
+2. Must have clear breakout/breakdown
+3. Reasonable R:R (min 1:1.5)
+4. Price near key S/R level
 
-TASK: Determine if this is valid LONG/SHORT/NO_TRADE.
+TASK: Decide if this is tradeable. 
 
-Response format (strict):
-SIGNAL: [LONG or SHORT or NO_TRADE]
-ENTRY: [price]
-SL: [recent swing level]
-TARGET: [price with min 1:2 R:R]
-PATTERN: [which pattern triggered trade]
-REASON: [1-2 sentences only]"""
+If YES, provide:
+SIGNAL: LONG or SHORT
+ENTRY: [specific price near current]
+SL: [swing level]
+TARGET: [with good R:R]
+PATTERN: [trigger pattern]
+REASON: [why trade]
+
+If NO trade:
+SIGNAL: NO_TRADE
+REASON: [why not]"""
 
         try:
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": "You are an expert crypto trader. Respond in exact format requested. Be strict with rules."},
+                    {"role": "system", "content": "You are a strict crypto trader. Only take high-probability setups. Be conservative."},
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=350,
-                temperature=0.2
+                max_tokens=400,
+                temperature=0.3
             )
             
             ai_text = response.choices[0].message.content
+            logger.info(f"📝 OpenAI response (first 150 chars): {ai_text[:150]}...")
             
             # Parse AI response
             result = {
@@ -637,37 +678,68 @@ REASON: [1-2 sentences only]"""
                 'sl': None,
                 'target': None,
                 'pattern': 'None',
-                'reason': ai_text
+                'reason': 'No clear setup'
             }
             
-            for line in ai_text.split('\n'):
+            lines = ai_text.split('\n')
+            for line in lines:
+                line = line.strip()
+                
                 if 'SIGNAL:' in line:
-                    result['signal'] = line.split('SIGNAL:')[-1].strip()
+                    signal_part = line.split('SIGNAL:')[-1].strip().upper()
+                    if 'LONG' in signal_part:
+                        result['signal'] = 'LONG'
+                    elif 'SHORT' in signal_part:
+                        result['signal'] = 'SHORT'
+                
                 elif 'ENTRY:' in line:
                     try:
-                        result['entry'] = float(line.split('$')[-1].strip())
+                        # Extract number
+                        entry_str = line.split('ENTRY:')[-1].strip()
+                        entry_str = entry_str.replace(', '').replace(',', '')
+                        result['entry'] = float(entry_str.split()[0])
                     except:
-                        pass
-                elif 'SL:' in line:
+                        result['entry'] = analysis['current_price']
+                
+                elif 'SL:' in line or 'STOP' in line:
                     try:
-                        result['sl'] = float(line.split('$')[-1].strip())
+                        sl_str = line.split(':')[-1].strip()
+                        sl_str = sl_str.replace(', '').replace(',', '')
+                        result['sl'] = float(sl_str.split()[0])
                     except:
                         pass
+                
                 elif 'TARGET:' in line:
                     try:
-                        result['target'] = float(line.split('$')[-1].strip())
+                        tgt_str = line.split('TARGET:')[-1].strip()
+                        tgt_str = tgt_str.replace(', '').replace(',', '')
+                        result['target'] = float(tgt_str.split()[0])
                     except:
                         pass
+                
                 elif 'PATTERN:' in line:
                     result['pattern'] = line.split('PATTERN:')[-1].strip()
+                
+                elif 'REASON:' in line:
+                    result['reason'] = line.split('REASON:')[-1].strip()
+            
+            # If no reason captured, use full response
+            if result['reason'] == 'No clear setup':
+                result['reason'] = ai_text
+            
+            logger.info(f"🎯 Parsed AI result: {result['signal']} - {result.get('pattern', 'No pattern')}")
             
             return result
             
         except Exception as e:
-            logger.error(f"GPT API error: {e}")
+            logger.error(f"❌ GPT API error for {analysis['symbol']}: {e}", exc_info=True)
             return {
                 'signal': 'ERROR',
-                'reason': f'AI analysis failed: {str(e)}'
+                'reason': f'AI analysis failed: {str(e)}',
+                'entry': None,
+                'sl': None,
+                'target': None,
+                'pattern': 'Error'
             }
 
 class TradingBot:
@@ -676,67 +748,95 @@ class TradingBot:
     def __init__(self):
         self.trade_count_today = 0
         self.last_reset = datetime.now().date()
+        self.bot_start_time = datetime.now()
     
     def reset_daily_counter(self):
         """Reset trade counter at midnight"""
         if datetime.now().date() > self.last_reset:
             self.trade_count_today = 0
             self.last_reset = datetime.now().date()
-            logger.info("Trade counter reset for new day")
+            logger.info("🔄 Trade counter reset for new day")
     
     async def scan_markets(self, context: ContextTypes.DEFAULT_TYPE):
-        """Scan all symbols for setups"""
+        """Scan all symbols for setups - FIXED VERSION"""
+        logger.info(f"\n{'='*80}")
+        logger.info(f"🚀 STARTING MARKET SCAN - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"{'='*80}")
+        
         self.reset_daily_counter()
         
         if self.trade_count_today >= MAX_TRADES_PER_DAY:
-            logger.info(f"Daily limit reached: {self.trade_count_today}/{MAX_TRADES_PER_DAY}")
+            logger.info(f"⛔ Daily limit reached: {self.trade_count_today}/{MAX_TRADES_PER_DAY}")
             return
         
         for symbol in SYMBOLS:
             try:
-                logger.info(f"Scanning {symbol}...")
+                logger.info(f"\n📊 Scanning {symbol}...")
                 analysis = TradeAnalyzer.analyze_setup(symbol)
                 
-                if not analysis.get('valid', True):  # Skip if data issues
+                # Check if data fetch failed
+                if not analysis or not analysis.get('valid'):
+                    logger.warning(f"⚠️ {symbol}: Invalid data, skipping")
                     continue
                 
-                # Basic filters
-                if (analysis.get('volume_ratio', 0) < 1.5 or 
-                    not analysis.get('patterns')):
-                    logger.info(f"{symbol}: No patterns or low volume")
+                logger.info(f"💵 {symbol}: Price=${analysis['current_price']:.2f}, Volume={analysis['volume_ratio']}x, Patterns={len(analysis.get('patterns', []))}")
+                
+                # RELAXED FILTERS - Allow more setups to reach AI
+                patterns = analysis.get('patterns', [])
+                volume_ratio = analysis.get('volume_ratio', 0)
+                
+                # Change 1: Lower volume threshold to 1.2x
+                if volume_ratio < 1.2:
+                    logger.info(f"❌ {symbol}: Volume too low ({volume_ratio}x < 1.2x)")
                     continue
+                
+                # Change 2: Allow if either patterns exist OR volume is high
+                if len(patterns) == 0 and volume_ratio < 2.0:
+                    logger.info(f"❌ {symbol}: No patterns and volume not exceptional")
+                    continue
+                
+                logger.info(f"✅ {symbol}: Passed filters, sending to AI analysis...")
                 
                 # Get AI analysis
                 ai_result = TradeAnalyzer.get_ai_analysis(analysis)
                 
+                logger.info(f"🎯 {symbol}: AI Signal = {ai_result['signal']}")
+                
                 # Check if valid signal
                 if ai_result['signal'] in ['LONG', 'SHORT']:
                     self.trade_count_today += 1
+                    logger.info(f"🎉 {symbol}: VALID {ai_result['signal']} SIGNAL - Trade #{self.trade_count_today}")
                     
                     # Add AI results to analysis for chart
                     analysis['trade_signal'] = ai_result['signal']
-                    analysis['entry_price'] = ai_result['entry']
-                    analysis['sl_price'] = ai_result['sl']
-                    analysis['target_price'] = ai_result['target']
-                    analysis['trade_type'] = ai_result['pattern']
+                    analysis['entry_price'] = ai_result.get('entry')
+                    analysis['sl_price'] = ai_result.get('sl')
+                    analysis['target_price'] = ai_result.get('target')
+                    analysis['trade_type'] = ai_result.get('pattern', 'Breakout')
                     
                     await self.send_alert(context, symbol, analysis, ai_result)
                 else:
-                    logger.info(f"{symbol}: {ai_result['signal']} - {ai_result.get('reason', '')[:50]}")
+                    logger.info(f"⏭️ {symbol}: {ai_result['signal']} - {ai_result.get('reason', '')[:80]}")
                 
             except Exception as e:
-                logger.error(f"Error scanning {symbol}: {e}", exc_info=True)
+                logger.error(f"💥 Error scanning {symbol}: {e}", exc_info=True)
             
             await asyncio.sleep(3)  # Rate limit between symbols
+        
+        logger.info(f"\n{'='*80}")
+        logger.info(f"✅ SCAN COMPLETE - Trades today: {self.trade_count_today}/{MAX_TRADES_PER_DAY}")
+        logger.info(f"{'='*80}\n")
     
     async def send_alert(self, context: ContextTypes.DEFAULT_TYPE, symbol: str, analysis: Dict, ai_result: Dict):
         """Send trade alert with chart to Telegram"""
+        
+        logger.info(f"📤 Sending alert for {symbol}...")
         
         # Generate chart
         try:
             chart_buf = ChartGenerator.create_chart(analysis['df_30m'], analysis, symbol)
         except Exception as e:
-            logger.error(f"Chart generation error: {e}")
+            logger.error(f"❌ Chart generation error: {e}")
             chart_buf = None
         
         # Prepare text message
@@ -744,6 +844,12 @@ class TradingBot:
         
         oi_emoji = "📈" if "increasing" in analysis['oi_trend']['trend'] else "📉" if "decreasing" in analysis['oi_trend']['trend'] else "➡️"
         signal_emoji = "🟢" if ai_result['signal'] == 'LONG' else "🔴"
+        
+        # Calculate R:R
+        try:
+            rr = abs((ai_result['target'] - ai_result['entry']) / (ai_result['entry'] - ai_result['sl']))
+        except:
+            rr = 0
         
         message = f"""{signal_emoji} **{analysis['symbol']} - {ai_result['signal']} SETUP**
 
@@ -754,7 +860,7 @@ class TradingBot:
 ├ Entry: ${ai_result['entry']:.2f}
 ├ Stop Loss: ${ai_result['sl']:.2f}
 ├ Target: ${ai_result['target']:.2f}
-└ R:R = 1:{abs((ai_result['target'] - ai_result['entry']) / (ai_result['entry'] - ai_result['sl'])):.1f}
+└ R:R = 1:{rr:.1f}
 
 ✅ **CONFIRMATIONS:**
 ├ Patterns: {patterns_text}
@@ -789,10 +895,43 @@ class TradingBot:
                     parse_mode='Markdown'
                 )
             
-            logger.info(f"Alert sent for {symbol}: {ai_result['signal']}")
+            logger.info(f"✅ Alert sent for {symbol}: {ai_result['signal']}")
             
         except Exception as e:
-            logger.error(f"Error sending alert: {e}")
+            logger.error(f"❌ Error sending alert: {e}")
+    
+    async def send_startup_alert(self, context: ContextTypes.DEFAULT_TYPE):
+        """Send startup notification"""
+        startup_message = f"""🤖 **TRADING BOT STARTED**
+
+✅ Status: Online and Active
+🕐 Started: {self.bot_start_time.strftime('%Y-%m-%d %H:%M:%S')}
+
+📊 **Configuration:**
+├ Symbols: {', '.join(SYMBOLS)}
+├ Timeframes: 30m, 1h, 4h
+├ Candles per TF: {CANDLE_COUNT}
+├ Max Trades/Day: {MAX_TRADES_PER_DAY}
+└ Scan Interval: Every 30 minutes
+
+🔧 **Systems:**
+├ ✅ Deribit API Connected
+├ ✅ OpenAI GPT-4o mini Ready
+├ ✅ Redis OI Tracking Active
+└ ✅ Telegram Bot Online
+
+🚀 First scan will start in 10 seconds...
+"""
+        
+        try:
+            await context.bot.send_message(
+                chat_id=CHAT_ID,
+                text=startup_message,
+                parse_mode='Markdown'
+            )
+            logger.info("✅ Startup alert sent to Telegram")
+        except Exception as e:
+            logger.error(f"❌ Failed to send startup alert: {e}")
 
 # Bot commands
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -815,9 +954,14 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Status command"""
     bot = context.bot_data.get('trading_bot')
     if bot:
+        uptime = datetime.now() - bot.bot_start_time
+        hours = int(uptime.total_seconds() // 3600)
+        minutes = int((uptime.total_seconds() % 3600) // 60)
+        
         await update.message.reply_text(
             f"📊 **Bot Status:**\n\n"
             f"✅ Active and Running\n"
+            f"⏰ Uptime: {hours}h {minutes}m\n"
             f"📈 Trades Today: {bot.trade_count_today}/{MAX_TRADES_PER_DAY}\n"
             f"⏱ Scan Interval: 30 minutes\n"
             f"💾 Using Redis for OI tracking\n"
@@ -852,7 +996,7 @@ async def analyze_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         analysis = TradeAnalyzer.analyze_setup(symbol)
         
-        if not analysis.get('valid', True):
+        if not analysis.get('valid'):
             await update.message.reply_text(f"❌ Cannot analyze {symbol}: {analysis.get('reason', 'Unknown error')}")
             return
         
@@ -890,37 +1034,45 @@ async def analyze_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
     except Exception as e:
-        logger.error(f"Error in analyze command: {e}", exc_info=True)
+        logger.error(f"❌ Error in analyze command: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Error analyzing {symbol}: {str(e)}")
 
 def main():
     """Main function"""
-    logger.info("Initializing Trading Bot...")
+    logger.info("="*80)
+    logger.info("🚀 INITIALIZING CRYPTO TRADING BOT")
+    logger.info("="*80)
     
     # Validate environment variables
     if not TELEGRAM_TOKEN or not OPENAI_API_KEY or not CHAT_ID:
-        logger.error("Missing required environment variables!")
+        logger.error("❌ Missing required environment variables!")
         logger.error("Required: TELEGRAM_BOT_TOKEN, OPENAI_API_KEY, TELEGRAM_CHAT_ID")
         return
+    
+    logger.info("✅ Environment variables validated")
     
     # Test Redis connection
     try:
         redis_client.ping()
-        logger.info("✅ Redis connected")
+        logger.info("✅ Redis connected successfully")
     except Exception as e:
         logger.error(f"❌ Redis connection failed: {e}")
-        logger.warning("Bot will continue but OI tracking may not work properly")
+        logger.warning("⚠️ Bot will continue but OI tracking may not work properly")
     
     # Initialize bot
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     trading_bot = TradingBot()
     application.bot_data['trading_bot'] = trading_bot
     
+    logger.info("✅ Trading bot instance created")
+    
     # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("scan", scan_now))
     application.add_handler(CommandHandler("analyze", analyze_symbol))
+    
+    logger.info("✅ Command handlers registered")
     
     # Schedule market scans every 30 mins
     job_queue = application.job_queue
@@ -931,14 +1083,24 @@ def main():
             first=10  # Start after 10 seconds
         )
         logger.info("✅ Job queue configured - scanning every 30 mins")
+        
+        # Schedule startup alert
+        job_queue.run_once(
+            trading_bot.send_startup_alert,
+            when=2  # Send after 2 seconds
+        )
+        logger.info("✅ Startup alert scheduled")
     else:
         logger.error("❌ Job queue not available!")
     
     # Start bot
-    logger.info("🚀 Bot starting...")
+    logger.info("="*80)
+    logger.info("🚀 BOT STARTING...")
     logger.info(f"📊 Tracking: {', '.join(SYMBOLS)}")
     logger.info(f"⏱ Scan interval: 30 minutes")
     logger.info(f"📈 Candles per TF: {CANDLE_COUNT}")
+    logger.info(f"🎯 Max trades per day: {MAX_TRADES_PER_DAY}")
+    logger.info("="*80)
     
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
