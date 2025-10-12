@@ -45,39 +45,104 @@ CANDLE_COUNT = 500  # 500 candles for all timeframes
 class DeribitClient:
     """Fetch data from Deribit public API"""
     
+    # Resolution mapping for Deribit
+    RESOLUTION_MAP = {
+        '30': '30',   # 30 minutes
+        '60': '60',   # 1 hour
+        '240': '1D'   # Use daily for 4h (Deribit limitation)
+    }
+    
     @staticmethod
     def get_candles(symbol: str, timeframe: str, count: int = CANDLE_COUNT) -> pd.DataFrame:
         """Fetch OHLCV data - 500 candles"""
+        
+        # For 4hr, we'll use daily candles as Deribit may not support 240
+        resolution = DeribitClient.RESOLUTION_MAP.get(timeframe, timeframe)
+        
         url = f"{DERIBIT_BASE}/get_tradingview_chart_data"
         
-        # Calculate time range for 500 candles
+        # Calculate time range
         tf_minutes = int(timeframe)
-        days_needed = (count * tf_minutes) // (24 * 60) + 7  # Extra buffer
+        if timeframe == '240':
+            # Daily candles
+            days_needed = count + 10
+        else:
+            days_needed = (count * tf_minutes) // (24 * 60) + 10
         
         params = {
             'instrument_name': symbol,
-            'resolution': timeframe,
+            'resolution': resolution,
             'start_timestamp': int((datetime.now() - timedelta(days=days_needed)).timestamp() * 1000),
             'end_timestamp': int(datetime.now().timestamp() * 1000)
         }
         
         try:
-            response = requests.get(url, params=params, timeout=10)
+            response = requests.get(url, params=params, timeout=15)
+            
+            # Check HTTP status
+            if response.status_code != 200:
+                logger.error(f"Deribit API HTTP {response.status_code} for {symbol} {timeframe}m")
+                return pd.DataFrame()
+            
             data = response.json()
             
-            if data['result']['status'] == 'ok':
-                df = pd.DataFrame({
-                    'timestamp': pd.to_datetime(data['result']['ticks'], unit='ms'),
-                    'open': data['result']['open'],
-                    'high': data['result']['high'],
-                    'low': data['result']['low'],
-                    'close': data['result']['close'],
-                    'volume': data['result']['volume']
-                })
-                df.set_index('timestamp', inplace=True)
-                return df.tail(count)
+            # Check for error in response
+            if 'error' in data:
+                logger.error(f"Deribit API error for {symbol} {timeframe}m: {data['error']}")
+                return pd.DataFrame()
+            
+            # Check result exists
+            if 'result' not in data:
+                logger.error(f"No 'result' in Deribit response for {symbol} {timeframe}m")
+                logger.debug(f"Response: {str(data)[:200]}")
+                return pd.DataFrame()
+            
+            result = data['result']
+            
+            # Validate result structure
+            if result.get('status') != 'ok':
+                logger.error(f"Deribit status not OK for {symbol} {timeframe}m: {result.get('status')}")
+                return pd.DataFrame()
+            
+            # Check required fields
+            required_fields = ['ticks', 'open', 'high', 'low', 'close', 'volume']
+            missing = [f for f in required_fields if f not in result]
+            if missing:
+                logger.error(f"Missing fields in Deribit response for {symbol} {timeframe}m: {missing}")
+                return pd.DataFrame()
+            
+            # Create DataFrame
+            df = pd.DataFrame({
+                'timestamp': pd.to_datetime(result['ticks'], unit='ms'),
+                'open': result['open'],
+                'high': result['high'],
+                'low': result['low'],
+                'close': result['close'],
+                'volume': result['volume']
+            })
+            
+            if len(df) == 0:
+                logger.warning(f"Empty dataframe for {symbol} {timeframe}m")
+                return pd.DataFrame()
+            
+            df.set_index('timestamp', inplace=True)
+            
+            # For 4hr timeframe using daily data, resample
+            if timeframe == '240':
+                logger.info(f"Using daily data for 4hr timeframe {symbol}")
+            
+            logger.info(f"Fetched {len(df)} candles for {symbol} {resolution} ({timeframe}m requested)")
+            return df.tail(count)
+            
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout fetching candles for {symbol} {timeframe}m")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request error fetching candles for {symbol} {timeframe}m: {e}")
+        except KeyError as e:
+            logger.error(f"KeyError in Deribit data for {symbol} {timeframe}m: {e}")
         except Exception as e:
-            logger.error(f"Error fetching candles for {symbol} {timeframe}m: {e}")
+            logger.error(f"Unexpected error fetching candles for {symbol} {timeframe}m: {e}", exc_info=True)
+        
         return pd.DataFrame()
     
     @staticmethod
