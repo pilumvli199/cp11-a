@@ -524,6 +524,11 @@ class TradeAnalyzer:
         support_30m = analysis['swing_lows_30m'][-1]['price'] if analysis.get('swing_lows_30m') else None
         resistance_30m = analysis['swing_highs_30m'][-1]['price'] if analysis.get('swing_highs_30m') else None
         
+        support_30m_str = f"${support_30m:.2f}" if support_30m else "N/A"
+        resistance_30m_str = f"${resistance_30m:.2f}" if resistance_30m else "N/A"
+        support_4h_str = f"${analysis.get('support_4h'):.2f}" if analysis.get('support_4h') else "N/A"
+        resistance_4h_str = f"${analysis.get('resistance_4h'):.2f}" if analysis.get('resistance_4h') else "N/A"
+        
         prompt = f"""Analyze this crypto setup for {analysis['symbol']}:
 
 CURRENT PRICE: ${analysis['current_price']:.2f}
@@ -538,10 +543,10 @@ OPEN INTEREST:
 - Change: {analysis.get('oi_trend', {}).get('change', 0):.1f}%
 
 KEY LEVELS:
-- 30m Support: ${support_30m:.2f if support_30m else 0}
-- 30m Resistance: ${resistance_30m:.2f if resistance_30m else 0}
-- 4H Support: ${analysis.get('support_4h', 0):.2f if analysis.get('support_4h') else 0}
-- 4H Resistance: ${analysis.get('resistance_4h', 0):.2f if analysis.get('resistance_4h') else 0}
+- 30m Support: {support_30m_str}
+- 30m Resistance: {resistance_30m_str}
+- 4H Support: {support_4h_str}
+- 4H Resistance: {resistance_4h_str}
 
 TRADING RULES:
 1. Volume should be >1.2x (you have {analysis.get('volume_ratio', 0):.2f}x)
