@@ -1,448 +1,600 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Multi-Exchange Crypto Data Fetcher - Testing Version
-Fetches data every 5 minutes and sends to Telegram
-"""
-
-import os
-import time
-import hmac
-import hashlib
 import asyncio
-import requests
-from datetime import datetime, timezone
-from dotenv import load_dotenv
-import schedule
+import aiohttp
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import mplfinance as mpf
+import matplotlib.pyplot as plt
+from telegram import Bot
+from telegram.error import TelegramError
 import logging
-from typing import Dict, List, Optional
+from typing import List, Dict, Tuple, Optional
+import json
+from collections import defaultdict
 
-# Load environment variables
-load_dotenv()
+# ======================== CONFIGURATION ========================
+DERIBIT_API_URL = "https://www.deribit.com/api/v2/public"
+TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
 
-# Configuration
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-DELTA_API_KEY = os.getenv('DELTA_API_KEY')
-DELTA_API_SECRET = os.getenv('DELTA_API_SECRET')
-DEBUG_MODE = os.getenv('DEBUG_MODE', 'False') == 'True'
+TIMEFRAME = "30"  # 30 minutes
+CANDLES_FOR_ANALYSIS = 500
+CANDLES_FOR_CHART = 200
+TOP_N_COINS = 20
+SR_ZONE_PERCENT = 0.004  # 0.4% zone width
+MIN_TOUCHES_NORMAL = 2  # Normal S/R needs 2-3 touches
+MIN_VOLUME_SPIKE = 1.5  # 1.5x average volume for confirmation
 
-# Setup logging
+# Logging setup
 logging.basicConfig(
-    level=logging.DEBUG if DEBUG_MODE else logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('data_fetcher.log'),
-        logging.StreamHandler()
-    ]
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# =============================================================================
-# EXCHANGE DATA FETCHERS
-# =============================================================================
-
-class BinanceFetcher:
-    """Fetch Binance spot + futures data (Public API)"""
-    BASE_URL = "https://api.binance.com"
-    FAPI_URL = "https://fapi.binance.com"
-    
-    @staticmethod
-    def get_btc_data() -> Dict:
-        try:
-            # Spot Volume
-            spot_response = requests.get(
-                f"{BinanceFetcher.BASE_URL}/api/v3/ticker/24hr",
-                params={"symbol": "BTCUSDT"},
-                timeout=10
-            )
-            spot_data = spot_response.json()
-            
-            # Futures Open Interest
-            oi_response = requests.get(
-                f"{BinanceFetcher.FAPI_URL}/fapi/v1/openInterest",
-                params={"symbol": "BTCUSDT"},
-                timeout=10
-            )
-            oi_data = oi_response.json()
-            
-            # Funding Rate
-            funding_response = requests.get(
-                f"{BinanceFetcher.FAPI_URL}/fapi/v1/fundingRate",
-                params={"symbol": "BTCUSDT", "limit": 1},
-                timeout=10
-            )
-            funding_data = funding_response.json()[0] if funding_response.json() else {}
-            
-            return {
-                "exchange": "Binance",
-                "spot_volume_24h": float(spot_data.get('quoteVolume', 0)),
-                "spot_price": float(spot_data.get('lastPrice', 0)),
-                "futures_oi": float(oi_data.get('openInterest', 0)),
-                "funding_rate": float(funding_data.get('fundingRate', 0)),
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Binance fetch error: {e}")
-            return {"exchange": "Binance", "error": str(e)}
-
-
-class OKXFetcher:
-    """Fetch OKX derivatives data (Public API)"""
-    BASE_URL = "https://www.okx.com"
-    
-    @staticmethod
-    def get_btc_data() -> Dict:
-        try:
-            # Spot ticker
-            ticker_response = requests.get(
-                f"{OKXFetcher.BASE_URL}/api/v5/market/ticker",
-                params={"instId": "BTC-USDT"},
-                timeout=10
-            )
-            ticker_data = ticker_response.json()['data'][0]
-            
-            # SWAP Open Interest
-            oi_response = requests.get(
-                f"{OKXFetcher.BASE_URL}/api/v5/public/open-interest",
-                params={"instId": "BTC-USDT-SWAP"},
-                timeout=10
-            )
-            oi_data = oi_response.json()['data'][0] if oi_response.json()['data'] else {}
-            
-            # Funding Rate
-            funding_response = requests.get(
-                f"{OKXFetcher.BASE_URL}/api/v5/public/funding-rate",
-                params={"instId": "BTC-USDT-SWAP"},
-                timeout=10
-            )
-            funding_data = funding_response.json()['data'][0] if funding_response.json()['data'] else {}
-            
-            return {
-                "exchange": "OKX",
-                "spot_volume_24h": float(ticker_data.get('volCcy24h', 0)),
-                "spot_price": float(ticker_data.get('last', 0)),
-                "swap_oi": float(oi_data.get('oi', 0)),
-                "funding_rate": float(funding_data.get('fundingRate', 0)),
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
-        except Exception as e:
-            logger.error(f"OKX fetch error: {e}")
-            return {"exchange": "OKX", "error": str(e)}
-
-
-class BybitFetcher:
-    """Fetch Bybit perpetuals data (Public API)"""
-    BASE_URL = "https://api.bybit.com"
-    
-    @staticmethod
-    def get_btc_data() -> Dict:
-        try:
-            # Ticker data
-            ticker_response = requests.get(
-                f"{BybitFetcher.BASE_URL}/v5/market/tickers",
-                params={"category": "linear", "symbol": "BTCUSDT"},
-                timeout=10
-            )
-            ticker_data = ticker_response.json()['result']['list'][0]
-            
-            # Open Interest
-            oi_response = requests.get(
-                f"{BybitFetcher.BASE_URL}/v5/market/open-interest",
-                params={"category": "linear", "symbol": "BTCUSDT", "intervalTime": "5min"},
-                timeout=10
-            )
-            oi_data = oi_response.json()['result']['list'][0] if oi_response.json()['result']['list'] else {}
-            
-            # Funding Rate
-            funding_response = requests.get(
-                f"{BybitFetcher.BASE_URL}/v5/market/funding/history",
-                params={"category": "linear", "symbol": "BTCUSDT", "limit": 1},
-                timeout=10
-            )
-            funding_data = funding_response.json()['result']['list'][0] if funding_response.json()['result']['list'] else {}
-            
-            return {
-                "exchange": "Bybit",
-                "spot_volume_24h": float(ticker_data.get('turnover24h', 0)),
-                "spot_price": float(ticker_data.get('lastPrice', 0)),
-                "perpetual_oi": float(oi_data.get('openInterest', 0)),
-                "funding_rate": float(funding_data.get('fundingRate', 0)),
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Bybit fetch error: {e}")
-            return {"exchange": "Bybit", "error": str(e)}
-
-
+# ======================== DERIBIT API FUNCTIONS ========================
 class DeribitFetcher:
-    """Fetch Deribit options data (Public API)"""
-    BASE_URL = "https://www.deribit.com/api/v2"
+    def __init__(self):
+        self.session = None
+        
+    async def create_session(self):
+        if not self.session:
+            self.session = aiohttp.ClientSession()
     
-    @staticmethod
-    def get_btc_data() -> Dict:
+    async def close_session(self):
+        if self.session:
+            await self.session.close()
+    
+    async def get_instruments(self) -> List[str]:
+        """Get top volume perpetual futures from Deribit"""
         try:
-            # Options book summary
-            summary_response = requests.get(
-                f"{DeribitFetcher.BASE_URL}/public/get_book_summary_by_currency",
-                params={"currency": "BTC", "kind": "option"},
-                timeout=10
-            )
-            summary_data = summary_response.json()['result']
-            
-            # Calculate total Call and Put OI
-            total_call_oi = sum(float(item['open_interest']) for item in summary_data if item['instrument_name'].endswith('C'))
-            total_put_oi = sum(float(item['open_interest']) for item in summary_data if item['instrument_name'].endswith('P'))
-            
-            # PCR Ratio
-            pcr_ratio = total_put_oi / total_call_oi if total_call_oi > 0 else 0
-            
-            # Spot price from futures
-            futures_response = requests.get(
-                f"{DeribitFetcher.BASE_URL}/public/ticker",
-                params={"instrument_name": "BTC-PERPETUAL"},
-                timeout=10
-            )
-            futures_data = futures_response.json()['result']
-            
-            return {
-                "exchange": "Deribit",
-                "total_call_oi": total_call_oi,
-                "total_put_oi": total_put_oi,
-                "pcr_ratio": round(pcr_ratio, 2),
-                "spot_price": float(futures_data.get('last_price', 0)),
-                "volume_24h": float(futures_data.get('stats', {}).get('volume', 0)),
-                "timestamp": datetime.now(timezone.utc).isoformat()
+            url = f"{DERIBIT_API_URL}/get_instruments"
+            params = {
+                "currency": "any",
+                "kind": "future",
+                "expired": "false"
             }
+            
+            async with self.session.get(url, params=params) as response:
+                data = await response.json()
+                
+                if data.get("result"):
+                    # Filter perpetual contracts only
+                    perpetuals = [
+                        inst for inst in data["result"] 
+                        if inst["settlement_period"] == "perpetual"
+                    ]
+                    
+                    # Sort by volume and get top N
+                    sorted_perps = sorted(
+                        perpetuals, 
+                        key=lambda x: x.get("stats", {}).get("volume_usd", 0), 
+                        reverse=True
+                    )[:TOP_N_COINS]
+                    
+                    symbols = [inst["instrument_name"] for inst in sorted_perps]
+                    logger.info(f"✅ Fetched {len(symbols)} perpetual contracts")
+                    return symbols
+                
+                return []
         except Exception as e:
-            logger.error(f"Deribit fetch error: {e}")
-            return {"exchange": "Deribit", "error": str(e)}
+            logger.error(f"❌ Error fetching instruments: {e}")
+            return []
+    
+    async def get_candles(self, symbol: str, count: int = CANDLES_FOR_ANALYSIS) -> pd.DataFrame:
+        """Fetch OHLCV candles for a symbol"""
+        try:
+            url = f"{DERIBIT_API_URL}/get_tradingview_chart_data"
+            
+            # Calculate start time (30min * count candles)
+            end_time = int(datetime.now().timestamp() * 1000)
+            start_time = end_time - (30 * 60 * 1000 * count)
+            
+            params = {
+                "instrument_name": symbol,
+                "resolution": TIMEFRAME,
+                "start_timestamp": start_time,
+                "end_timestamp": end_time
+            }
+            
+            async with self.session.get(url, params=params) as response:
+                data = await response.json()
+                
+                if data.get("result"):
+                    result = data["result"]
+                    
+                    df = pd.DataFrame({
+                        'timestamp': result['ticks'],
+                        'open': result['open'],
+                        'high': result['high'],
+                        'low': result['low'],
+                        'close': result['close'],
+                        'volume': result['volume']
+                    })
+                    
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    df.set_index('timestamp', inplace=True)
+                    
+                    return df
+                
+                return pd.DataFrame()
+        except Exception as e:
+            logger.error(f"❌ Error fetching candles for {symbol}: {e}")
+            return pd.DataFrame()
 
-
-class DeltaExchangeFetcher:
-    """Fetch Delta Exchange data (Authenticated API)"""
-    BASE_URL = "https://api.delta.exchange"
+# ======================== CANDLESTICK PATTERN DETECTION ========================
+class CandlestickPatterns:
+    @staticmethod
+    def is_pin_bar_bullish(candle: pd.Series) -> bool:
+        """Bullish Pin Bar / Hammer detection"""
+        body = abs(candle['close'] - candle['open'])
+        lower_wick = min(candle['open'], candle['close']) - candle['low']
+        upper_wick = candle['high'] - max(candle['open'], candle['close'])
+        
+        # Long lower wick (2x body), small upper wick
+        return (
+            lower_wick > 2 * body and
+            upper_wick < body * 0.3 and
+            candle['close'] > candle['open']  # Bullish close
+        )
     
     @staticmethod
-    def _generate_signature(method: str, endpoint: str, payload: str = "") -> Dict[str, str]:
-        """Generate HMAC signature for Delta Exchange"""
-        timestamp = str(int(time.time()))
-        message = method + timestamp + endpoint + payload
-        signature = hmac.new(
-            DELTA_API_SECRET.encode('utf-8'),
-            message.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
+    def is_shooting_star_bearish(candle: pd.Series) -> bool:
+        """Bearish Shooting Star / Inverted Hammer"""
+        body = abs(candle['close'] - candle['open'])
+        upper_wick = candle['high'] - max(candle['open'], candle['close'])
+        lower_wick = min(candle['open'], candle['close']) - candle['low']
+        
+        return (
+            upper_wick > 2 * body and
+            lower_wick < body * 0.3 and
+            candle['close'] < candle['open']  # Bearish close
+        )
+    
+    @staticmethod
+    def is_bullish_engulfing(prev: pd.Series, curr: pd.Series) -> bool:
+        """Bullish Engulfing Pattern"""
+        prev_bearish = prev['close'] < prev['open']
+        curr_bullish = curr['close'] > curr['open']
+        
+        return (
+            prev_bearish and
+            curr_bullish and
+            curr['close'] > prev['open'] and
+            curr['open'] < prev['close']
+        )
+    
+    @staticmethod
+    def is_bearish_engulfing(prev: pd.Series, curr: pd.Series) -> bool:
+        """Bearish Engulfing Pattern"""
+        prev_bullish = prev['close'] > prev['open']
+        curr_bearish = curr['close'] < curr['open']
+        
+        return (
+            prev_bullish and
+            curr_bearish and
+            curr['close'] < prev['open'] and
+            curr['open'] > prev['close']
+        )
+    
+    @staticmethod
+    def is_inside_bar(prev: pd.Series, curr: pd.Series) -> bool:
+        """Inside Bar (Compression)"""
+        return (
+            curr['high'] < prev['high'] and
+            curr['low'] > prev['low']
+        )
+
+# ======================== SUPPORT/RESISTANCE DETECTION ========================
+class SRDetector:
+    def __init__(self, zone_percent: float = SR_ZONE_PERCENT):
+        self.zone_percent = zone_percent
+    
+    def find_swing_points(self, df: pd.DataFrame, window: int = 5) -> Dict[str, List[float]]:
+        """Find swing highs and lows"""
+        supports = []
+        resistances = []
+        
+        for i in range(window, len(df) - window):
+            # Swing High (Resistance)
+            if df['high'].iloc[i] == df['high'].iloc[i-window:i+window+1].max():
+                resistances.append(df['high'].iloc[i])
+            
+            # Swing Low (Support)
+            if df['low'].iloc[i] == df['low'].iloc[i-window:i+window+1].min():
+                supports.append(df['low'].iloc[i])
         
         return {
-            "api-key": DELTA_API_KEY,
-            "timestamp": timestamp,
-            "signature": signature,
-            "Content-Type": "application/json"
+            'supports': supports,
+            'resistances': resistances
         }
     
-    @staticmethod
-    def get_btc_data() -> Dict:
-        try:
-            # Get tickers
-            endpoint = "/v2/tickers"
-            headers = DeltaExchangeFetcher._generate_signature("GET", endpoint)
-            
-            response = requests.get(
-                f"{DeltaExchangeFetcher.BASE_URL}{endpoint}",
-                headers=headers,
-                timeout=10
-            )
-            
-            tickers = response.json()['result']
-            
-            # Find BTC-USDT
-            btc_ticker = next((t for t in tickers if 'BTCUSDT' in t['symbol']), None)
-            
-            if not btc_ticker:
-                return {"exchange": "Delta Exchange", "error": "BTC ticker not found"}
-            
-            return {
-                "exchange": "Delta Exchange",
-                "spot_price": float(btc_ticker.get('close', 0)),
-                "volume_24h": float(btc_ticker.get('volume', 0)),
-                "oi": float(btc_ticker.get('open_interest', 0)),
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Delta Exchange fetch error: {e}")
-            return {"exchange": "Delta Exchange", "error": str(e)}
-
-
-# =============================================================================
-# TELEGRAM SENDER
-# =============================================================================
-
-class TelegramSender:
-    """Send formatted messages to Telegram"""
-    
-    @staticmethod
-    def send_message(message: str) -> bool:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            payload = {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True
-            }
-            response = requests.post(url, json=payload, timeout=10)
-            
-            if response.status_code == 200:
-                logger.info("✅ Telegram message sent successfully")
-                return True
+    def cluster_levels(self, levels: List[float], current_price: float) -> List[float]:
+        """Cluster similar price levels into zones"""
+        if not levels:
+            return []
+        
+        levels = sorted(levels)
+        clusters = []
+        current_cluster = [levels[0]]
+        
+        for level in levels[1:]:
+            # If within zone_percent, add to cluster
+            if (level - current_cluster[-1]) / current_cluster[-1] <= self.zone_percent:
+                current_cluster.append(level)
             else:
-                logger.error(f"❌ Telegram error: {response.text}")
-                return False
-        except Exception as e:
-            logger.error(f"❌ Telegram send error: {e}")
-            return False
+                # Store cluster average
+                clusters.append(np.mean(current_cluster))
+                current_cluster = [level]
+        
+        # Add last cluster
+        clusters.append(np.mean(current_cluster))
+        
+        return clusters
     
+    def count_touches(self, df: pd.DataFrame, level: float) -> int:
+        """Count how many times price touched a level"""
+        zone_high = level * (1 + self.zone_percent)
+        zone_low = level * (1 - self.zone_percent)
+        
+        touches = 0
+        for _, candle in df.iterrows():
+            if zone_low <= candle['low'] <= zone_high or zone_low <= candle['high'] <= zone_high:
+                touches += 1
+        
+        return touches
+    
+    def is_ath_atl(self, df: pd.DataFrame, level: float, level_type: str) -> bool:
+        """Check if level is All Time High/Low"""
+        if level_type == "resistance":
+            return level >= df['high'].max() * 0.999  # 0.1% tolerance
+        else:
+            return level <= df['low'].min() * 1.001
+
+    def detect_sr_levels(self, df: pd.DataFrame) -> Dict[str, List[Dict]]:
+        """Main S/R detection with validation"""
+        current_price = df['close'].iloc[-1]
+        
+        # Find swing points
+        swing_points = self.find_swing_points(df)
+        
+        # Cluster levels
+        support_levels = self.cluster_levels(swing_points['supports'], current_price)
+        resistance_levels = self.cluster_levels(swing_points['resistances'], current_price)
+        
+        # Validate levels
+        valid_supports = []
+        valid_resistances = []
+        
+        # Check supports
+        for level in support_levels:
+            touches = self.count_touches(df, level)
+            is_ath_atl = self.is_ath_atl(df, level, "support")
+            
+            # ATH/ATL = instant valid, OR 2+ touches, OR 1 touch with pattern
+            if is_ath_atl or touches >= MIN_TOUCHES_NORMAL:
+                valid_supports.append({
+                    'level': level,
+                    'touches': touches,
+                    'is_ath_atl': is_ath_atl,
+                    'distance_percent': ((current_price - level) / level) * 100
+                })
+        
+        # Check resistances
+        for level in resistance_levels:
+            touches = self.count_touches(df, level)
+            is_ath_atl = self.is_ath_atl(df, level, "resistance")
+            
+            if is_ath_atl or touches >= MIN_TOUCHES_NORMAL:
+                valid_resistances.append({
+                    'level': level,
+                    'touches': touches,
+                    'is_ath_atl': is_ath_atl,
+                    'distance_percent': ((level - current_price) / current_price) * 100
+                })
+        
+        return {
+            'supports': valid_supports,
+            'resistances': valid_resistances
+        }
+
+# ======================== TRADING SIGNAL GENERATOR ========================
+class SignalGenerator:
+    def __init__(self):
+        self.patterns = CandlestickPatterns()
+        self.sr_detector = SRDetector()
+    
+    def check_volume_spike(self, df: pd.DataFrame) -> bool:
+        """Check if recent volume is significantly higher"""
+        recent_volume = df['volume'].iloc[-1]
+        avg_volume = df['volume'].iloc[-50:-1].mean()
+        
+        return recent_volume > avg_volume * MIN_VOLUME_SPIKE
+    
+    def analyze_symbol(self, df: pd.DataFrame, symbol: str) -> Optional[Dict]:
+        """Complete analysis for a symbol"""
+        if len(df) < 50:
+            return None
+        
+        # Detect S/R levels
+        sr_levels = self.sr_detector.detect_sr_levels(df)
+        
+        # Get last 2 candles
+        curr_candle = df.iloc[-1]
+        prev_candle = df.iloc[-2]
+        current_price = curr_candle['close']
+        
+        # Check volume spike
+        volume_spike = self.check_volume_spike(df)
+        
+        # Check for signals near S/R levels
+        signal = None
+        
+        # Check Support levels
+        for support in sr_levels['supports']:
+            distance = abs(support['distance_percent'])
+            
+            # Price near support (within 1%)
+            if distance <= 1.0 and current_price < support['level']:
+                # Check for bullish patterns
+                if self.patterns.is_pin_bar_bullish(curr_candle):
+                    signal = {
+                        'symbol': symbol,
+                        'type': 'BUY',
+                        'pattern': 'Bullish Pin Bar',
+                        'sr_level': support['level'],
+                        'sr_type': 'Support',
+                        'price': current_price,
+                        'distance_percent': distance,
+                        'touches': support['touches'],
+                        'is_ath_atl': support['is_ath_atl'],
+                        'volume_spike': volume_spike,
+                        'timestamp': df.index[-1]
+                    }
+                    break
+                
+                elif self.patterns.is_bullish_engulfing(prev_candle, curr_candle):
+                    signal = {
+                        'symbol': symbol,
+                        'type': 'BUY',
+                        'pattern': 'Bullish Engulfing',
+                        'sr_level': support['level'],
+                        'sr_type': 'Support',
+                        'price': current_price,
+                        'distance_percent': distance,
+                        'touches': support['touches'],
+                        'is_ath_atl': support['is_ath_atl'],
+                        'volume_spike': volume_spike,
+                        'timestamp': df.index[-1]
+                    }
+                    break
+        
+        # Check Resistance levels
+        if not signal:
+            for resistance in sr_levels['resistances']:
+                distance = abs(resistance['distance_percent'])
+                
+                # Price near resistance (within 1%)
+                if distance <= 1.0 and current_price > resistance['level']:
+                    # Check for bearish patterns
+                    if self.patterns.is_shooting_star_bearish(curr_candle):
+                        signal = {
+                            'symbol': symbol,
+                            'type': 'SELL',
+                            'pattern': 'Shooting Star',
+                            'sr_level': resistance['level'],
+                            'sr_type': 'Resistance',
+                            'price': current_price,
+                            'distance_percent': distance,
+                            'touches': resistance['touches'],
+                            'is_ath_atl': resistance['is_ath_atl'],
+                            'volume_spike': volume_spike,
+                            'timestamp': df.index[-1]
+                        }
+                        break
+                    
+                    elif self.patterns.is_bearish_engulfing(prev_candle, curr_candle):
+                        signal = {
+                            'symbol': symbol,
+                            'type': 'SELL',
+                            'pattern': 'Bearish Engulfing',
+                            'sr_level': resistance['level'],
+                            'sr_type': 'Resistance',
+                            'price': current_price,
+                            'distance_percent': distance,
+                            'touches': resistance['touches'],
+                            'is_ath_atl': resistance['is_ath_atl'],
+                            'volume_spike': volume_spike,
+                            'timestamp': df.index[-1]
+                        }
+                        break
+        
+        return signal
+
+# ======================== CHART GENERATION ========================
+class ChartGenerator:
     @staticmethod
-    def format_data_message(all_data: List[Dict]) -> str:
-        """Format exchange data into readable Telegram message"""
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    def create_chart(df: pd.DataFrame, signal: Dict, sr_levels: Dict) -> str:
+        """Create TradingView-style chart with white background"""
+        # Take last CANDLES_FOR_CHART candles
+        chart_df = df.tail(CANDLES_FOR_CHART).copy()
         
-        message = f"<b>🔄 Multi-Exchange Data Update</b>\n"
-        message += f"<b>⏰ Time:</b> {timestamp}\n"
-        message += "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        # Prepare S/R lines
+        support_lines = [s['level'] for s in sr_levels['supports']]
+        resistance_lines = [r['level'] for r in sr_levels['resistances']]
         
-        # Process each exchange
-        for data in all_data:
-            exchange = data.get('exchange', 'Unknown')
-            
-            if 'error' in data:
-                message += f"<b>❌ {exchange}</b>\n"
-                message += f"Error: {data['error']}\n\n"
-                continue
-            
-            message += f"<b>📊 {exchange}</b>\n"
-            
-            # Binance
-            if exchange == "Binance":
-                message += f"💵 Spot Price: ${data.get('spot_price', 0):,.2f}\n"
-                message += f"📈 24h Volume: ${data.get('spot_volume_24h', 0)/1e9:.2f}B\n"
-                message += f"🔓 Futures OI: {data.get('futures_oi', 0):,.0f} BTC\n"
-                message += f"💰 Funding: {data.get('funding_rate', 0)*100:.4f}%\n"
-            
-            # OKX
-            elif exchange == "OKX":
-                message += f"💵 Spot Price: ${data.get('spot_price', 0):,.2f}\n"
-                message += f"📈 24h Volume: ${data.get('spot_volume_24h', 0)/1e6:.2f}M\n"
-                message += f"🔓 SWAP OI: {data.get('swap_oi', 0):,.0f}\n"
-                message += f"💰 Funding: {data.get('funding_rate', 0)*100:.4f}%\n"
-            
-            # Bybit
-            elif exchange == "Bybit":
-                message += f"💵 Spot Price: ${data.get('spot_price', 0):,.2f}\n"
-                message += f"📈 24h Volume: ${data.get('spot_volume_24h', 0)/1e9:.2f}B\n"
-                message += f"🔓 Perpetual OI: {data.get('perpetual_oi', 0):,.0f}\n"
-                message += f"💰 Funding: {data.get('funding_rate', 0)*100:.4f}%\n"
-            
-            # Deribit
-            elif exchange == "Deribit":
-                message += f"💵 Spot Price: ${data.get('spot_price', 0):,.2f}\n"
-                message += f"📞 Call OI: {data.get('total_call_oi', 0):,.0f} BTC\n"
-                message += f"📉 Put OI: {data.get('total_put_oi', 0):,.0f} BTC\n"
-                message += f"⚖️ PCR Ratio: {data.get('pcr_ratio', 0):.2f}\n"
-            
-            # Delta Exchange
-            elif exchange == "Delta Exchange":
-                message += f"💵 Spot Price: ${data.get('spot_price', 0):,.2f}\n"
-                message += f"📈 24h Volume: ${data.get('volume_24h', 0)/1e6:.2f}M\n"
-                message += f"🔓 Open Interest: {data.get('oi', 0):,.0f}\n"
-            
-            message += "\n"
+        # Create horizontal lines dict
+        hlines = {}
+        for i, level in enumerate(support_lines[:3]):  # Top 3 supports
+            hlines[level] = {'color': 'green', 'linewidth': 1.5, 'linestyle': '--'}
         
-        message += "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        message += "<i>Next update in 5 minutes</i>"
+        for i, level in enumerate(resistance_lines[:3]):  # Top 3 resistances
+            hlines[level] = {'color': 'red', 'linewidth': 1.5, 'linestyle': '--'}
         
-        return message
+        # Add signal level
+        hlines[signal['sr_level']] = {'color': 'blue', 'linewidth': 2, 'linestyle': '-'}
+        
+        # Create style with white background
+        mc = mpf.make_marketcolors(
+            up='#26a69a', down='#ef5350',
+            edge='inherit',
+            wick={'up': '#26a69a', 'down': '#ef5350'},
+            volume='in',
+            alpha=0.9
+        )
+        
+        s = mpf.make_mpf_style(
+            marketcolors=mc,
+            gridstyle='--',
+            gridcolor='#e0e0e0',
+            facecolor='white',
+            figcolor='white',
+            y_on_right=False
+        )
+        
+        # Save chart
+        filename = f"/home/claude/chart_{signal['symbol'].replace('/', '_')}_{int(datetime.now().timestamp())}.png"
+        
+        mpf.plot(
+            chart_df,
+            type='candle',
+            style=s,
+            volume=True,
+            hlines=hlines,
+            title=f"{signal['symbol']} - {signal['pattern']} @ {signal['sr_type']}",
+            ylabel='Price',
+            ylabel_lower='Volume',
+            savefig=filename,
+            figsize=(12, 8),
+            tight_layout=True
+        )
+        
+        logger.info(f"📊 Chart saved: {filename}")
+        return filename
 
+# ======================== TELEGRAM ALERTS ========================
+class TelegramAlerter:
+    def __init__(self, token: str, chat_id: str):
+        self.bot = Bot(token=token)
+        self.chat_id = chat_id
+    
+    async def send_alert(self, signal: Dict, chart_path: str):
+        """Send alert with chart to Telegram"""
+        try:
+            # Prepare message
+            msg = f"""
+🚨 **{signal['type']} SIGNAL** 🚨
 
-# =============================================================================
-# MAIN DATA FETCHING FUNCTION
-# =============================================================================
+📊 **Symbol:** {signal['symbol']}
+📈 **Pattern:** {signal['pattern']}
+💰 **Price:** ${signal['price']:.2f}
+🎯 **{signal['sr_type']}:** ${signal['sr_level']:.2f}
+📍 **Distance:** {signal['distance_percent']:.2f}%
+🔢 **Touches:** {signal['touches']} {'(ATH/ATL)' if signal['is_ath_atl'] else ''}
+📊 **Volume Spike:** {'✅ YES' if signal['volume_spike'] else '❌ NO'}
+⏰ **Time:** {signal['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}
 
-def fetch_and_send_data():
-    """Main function to fetch data from all exchanges and send to Telegram"""
-    logger.info("🚀 Starting data fetch cycle...")
-    
-    all_data = []
-    
-    # Fetch from all exchanges
-    logger.info("📡 Fetching Binance data...")
-    all_data.append(BinanceFetcher.get_btc_data())
-    
-    logger.info("📡 Fetching OKX data...")
-    all_data.append(OKXFetcher.get_btc_data())
-    
-    logger.info("📡 Fetching Bybit data...")
-    all_data.append(BybitFetcher.get_btc_data())
-    
-    logger.info("📡 Fetching Deribit data...")
-    all_data.append(DeribitFetcher.get_btc_data())
-    
-    logger.info("📡 Fetching Delta Exchange data...")
-    all_data.append(DeltaExchangeFetcher.get_btc_data())
-    
-    # Format and send to Telegram
-    logger.info("📤 Sending data to Telegram...")
-    message = TelegramSender.format_data_message(all_data)
-    TelegramSender.send_message(message)
-    
-    logger.info("✅ Data fetch cycle completed\n")
+{'🔥 **Strong Signal - ATH/ATL Level!**' if signal['is_ath_atl'] else ''}
+"""
+            
+            # Send chart image with caption
+            with open(chart_path, 'rb') as photo:
+                await self.bot.send_photo(
+                    chat_id=self.chat_id,
+                    photo=photo,
+                    caption=msg,
+                    parse_mode='Markdown'
+                )
+            
+            logger.info(f"✅ Alert sent for {signal['symbol']}")
+            
+        except TelegramError as e:
+            logger.error(f"❌ Telegram error: {e}")
+        except Exception as e:
+            logger.error(f"❌ Error sending alert: {e}")
 
-
-# =============================================================================
-# SCHEDULER
-# =============================================================================
-
-def run_scheduler():
-    """Run the scheduler to fetch data every 5 minutes"""
-    logger.info("="*60)
-    logger.info("🤖 Multi-Exchange Data Fetcher - Testing Mode")
-    logger.info("="*60)
-    logger.info(f"📅 Started at: {datetime.now(timezone.utc)}")
-    logger.info(f"⏱️  Fetch Interval: Every 5 minutes")
-    logger.info(f"📱 Telegram Chat ID: {TELEGRAM_CHAT_ID}")
-    logger.info("="*60 + "\n")
+# ======================== MAIN BOT ========================
+class SRTradingBot:
+    def __init__(self):
+        self.fetcher = DeribitFetcher()
+        self.signal_generator = SignalGenerator()
+        self.chart_generator = ChartGenerator()
+        self.alerter = TelegramAlerter(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+        self.last_alerts = defaultdict(lambda: None)  # Track last alert time per symbol
     
-    # Run immediately on start
-    fetch_and_send_data()
+    async def analyze_all_symbols(self):
+        """Analyze all top symbols"""
+        symbols = await self.fetcher.get_instruments()
+        
+        if not symbols:
+            logger.warning("⚠️ No symbols fetched!")
+            return
+        
+        logger.info(f"🔍 Analyzing {len(symbols)} symbols...")
+        
+        for symbol in symbols:
+            try:
+                # Fetch candles
+                df = await self.fetcher.get_candles(symbol, CANDLES_FOR_ANALYSIS)
+                
+                if df.empty:
+                    continue
+                
+                # Analyze for signals
+                signal = self.signal_generator.analyze_symbol(df, symbol)
+                
+                if signal:
+                    # Check if we already alerted recently (avoid spam)
+                    last_alert_time = self.last_alerts[symbol]
+                    current_time = datetime.now()
+                    
+                    if last_alert_time is None or (current_time - last_alert_time).seconds > 3600:  # 1 hour cooldown
+                        logger.info(f"🎯 Signal found for {symbol}: {signal['pattern']}")
+                        
+                        # Get S/R levels for chart
+                        sr_levels = self.signal_generator.sr_detector.detect_sr_levels(df)
+                        
+                        # Generate chart
+                        chart_path = self.chart_generator.create_chart(df, signal, sr_levels)
+                        
+                        # Send alert
+                        await self.alerter.send_alert(signal, chart_path)
+                        
+                        # Update last alert time
+                        self.last_alerts[symbol] = current_time
+                
+                # Small delay to avoid rate limits
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"❌ Error analyzing {symbol}: {e}")
     
-    # Schedule every 5 minutes
-    schedule.every(5).minutes.do(fetch_and_send_data)
-    
-    logger.info("⏳ Scheduler started. Press Ctrl+C to stop.\n")
-    
-    while True:
-        schedule.run_pending()
-        time.sleep(30)  # Check every 30 seconds
+    async def run(self):
+        """Main bot loop"""
+        await self.fetcher.create_session()
+        
+        logger.info("🚀 S/R Trading Bot Started!")
+        logger.info(f"⏱️  Analysis interval: Every 30 minutes")
+        logger.info(f"📊 Tracking top {TOP_N_COINS} coins")
+        
+        try:
+            while True:
+                try:
+                    await self.analyze_all_symbols()
+                    logger.info(f"✅ Analysis complete. Next run in 30 minutes...")
+                    await asyncio.sleep(30 * 60)  # 30 minutes
+                    
+                except Exception as e:
+                    logger.error(f"❌ Error in main loop: {e}")
+                    await asyncio.sleep(60)  # Wait 1 minute on error
+        
+        except KeyboardInterrupt:
+            logger.info("🛑 Bot stopped by user")
+        
+        finally:
+            await self.fetcher.close_session()
 
-
-# =============================================================================
-# ENTRY POINT
-# =============================================================================
-
+# ======================== ENTRY POINT ========================
 if __name__ == "__main__":
-    # Validate environment variables
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("❌ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in .env file")
-        exit(1)
-    
-    if not DELTA_API_KEY or not DELTA_API_SECRET:
-        logger.warning("⚠️  Delta Exchange API credentials missing. Delta data will fail.")
-    
-    try:
-        run_scheduler()
-    except KeyboardInterrupt:
-        logger.info("\n\n🛑 Scheduler stopped by user")
-    except Exception as e:
-        logger.error(f"❌ Fatal error: {e}")
-        raise
+    bot = SRTradingBot()
+    asyncio.run(bot.run())
