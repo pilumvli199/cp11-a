@@ -20,10 +20,33 @@ TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
 TIMEFRAME = "30"  # 30 minutes
 CANDLES_FOR_ANALYSIS = 500
 CANDLES_FOR_CHART = 200
-TOP_N_COINS = 20
 SR_ZONE_PERCENT = 0.004  # 0.4% zone width
 MIN_TOUCHES_NORMAL = 2  # Normal S/R needs 2-3 touches
 MIN_VOLUME_SPIKE = 1.5  # 1.5x average volume for confirmation
+
+# Top 20 coins for analysis (Deribit perpetual format)
+TOP_COINS = [
+    "BTC-PERPETUAL",      # Bitcoin
+    "ETH-PERPETUAL",      # Ethereum
+    "SOL-PERPETUAL",      # Solana
+    "XRP-PERPETUAL",      # Ripple
+    "BNB-PERPETUAL",      # Binance Coin
+    "ADA-PERPETUAL",      # Cardano
+    "AVAX-PERPETUAL",     # Avalanche
+    "DOGE-PERPETUAL",     # Dogecoin
+    "MATIC-PERPETUAL",    # Polygon
+    "LTC-PERPETUAL",      # Litecoin
+    "LINK-PERPETUAL",     # Chainlink
+    "DOT-PERPETUAL",      # Polkadot
+    "UNI-PERPETUAL",      # Uniswap
+    "ATOM-PERPETUAL",     # Cosmos
+    "MANA-PERPETUAL",     # Decentraland
+    "APE-PERPETUAL",      # ApeCoin
+    "FTM-PERPETUAL",      # Fantom
+    "SUI-PERPETUAL",      # Sui
+    "TRX-PERPETUAL",      # Tron
+    "BCH-PERPETUAL"       # Bitcoin Cash
+]
 
 # Logging setup
 logging.basicConfig(
@@ -46,40 +69,11 @@ class DeribitFetcher:
             await self.session.close()
     
     async def get_instruments(self) -> List[str]:
-        """Get top volume perpetual futures from Deribit"""
-        try:
-            url = f"{DERIBIT_API_URL}/get_instruments"
-            params = {
-                "currency": "any",
-                "kind": "future",
-                "expired": "false"
-            }
-            
-            async with self.session.get(url, params=params) as response:
-                data = await response.json()
-                
-                if data.get("result"):
-                    # Filter perpetual contracts only
-                    perpetuals = [
-                        inst for inst in data["result"] 
-                        if inst["settlement_period"] == "perpetual"
-                    ]
-                    
-                    # Sort by volume and get top N
-                    sorted_perps = sorted(
-                        perpetuals, 
-                        key=lambda x: x.get("stats", {}).get("volume_usd", 0), 
-                        reverse=True
-                    )[:TOP_N_COINS]
-                    
-                    symbols = [inst["instrument_name"] for inst in sorted_perps]
-                    logger.info(f"✅ Fetched {len(symbols)} perpetual contracts")
-                    return symbols
-                
-                return []
-        except Exception as e:
-            logger.error(f"❌ Error fetching instruments: {e}")
-            return []
+        """Return hardcoded top coins list"""
+        logger.info(f"📋 Using {len(TOP_COINS)} hardcoded perpetual contracts:")
+        for i, symbol in enumerate(TOP_COINS, 1):
+            logger.info(f"   {i}. {symbol}")
+        return TOP_COINS
     
     async def get_candles(self, symbol: str, count: int = CANDLES_FOR_ANALYSIS) -> pd.DataFrame:
         """Fetch OHLCV candles for a symbol"""
@@ -527,18 +521,25 @@ class SRTradingBot:
         symbols = await self.fetcher.get_instruments()
         
         if not symbols:
-            logger.warning("⚠️ No symbols fetched!")
+            logger.warning("⚠️ No symbols to analyze!")
             return
         
-        logger.info(f"🔍 Analyzing {len(symbols)} symbols...")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"🔍 STARTING ANALYSIS - {len(symbols)} SYMBOLS")
+        logger.info(f"{'='*60}\n")
         
-        for symbol in symbols:
+        for idx, symbol in enumerate(symbols, 1):
             try:
+                logger.info(f"[{idx}/{len(symbols)}] 📊 Analyzing {symbol}...")
+                
                 # Fetch candles
                 df = await self.fetcher.get_candles(symbol, CANDLES_FOR_ANALYSIS)
                 
                 if df.empty:
+                    logger.warning(f"   ⚠️ No data available for {symbol}")
                     continue
+                
+                logger.info(f"   ✅ Fetched {len(df)} candles | Latest: ${df['close'].iloc[-1]:.2f}")
                 
                 # Analyze for signals
                 signal = self.signal_generator.analyze_symbol(df, symbol)
@@ -549,7 +550,8 @@ class SRTradingBot:
                     current_time = datetime.now()
                     
                     if last_alert_time is None or (current_time - last_alert_time).seconds > 3600:  # 1 hour cooldown
-                        logger.info(f"🎯 Signal found for {symbol}: {signal['pattern']}")
+                        logger.info(f"   🎯 SIGNAL FOUND: {signal['type']} - {signal['pattern']}")
+                        logger.info(f"   💰 Price: ${signal['price']:.2f} | S/R: ${signal['sr_level']:.2f}")
                         
                         # Get S/R levels for chart
                         sr_levels = self.signal_generator.sr_detector.detect_sr_levels(df)
@@ -562,37 +564,56 @@ class SRTradingBot:
                         
                         # Update last alert time
                         self.last_alerts[symbol] = current_time
+                        logger.info(f"   ✉️ Alert sent successfully!\n")
+                    else:
+                        logger.info(f"   ⏸️ Signal found but cooldown active (last alert: {last_alert_time.strftime('%H:%M:%S')})")
+                else:
+                    logger.info(f"   ℹ️ No trading signals detected\n")
                 
                 # Small delay to avoid rate limits
                 await asyncio.sleep(0.5)
                 
             except Exception as e:
-                logger.error(f"❌ Error analyzing {symbol}: {e}")
+                logger.error(f"   ❌ Error analyzing {symbol}: {e}\n")
+        
+        logger.info(f"\n{'='*60}")
+        logger.info(f"✅ ANALYSIS COMPLETE")
+        logger.info(f"{'='*60}\n")
     
     async def run(self):
         """Main bot loop"""
         await self.fetcher.create_session()
         
-        logger.info("🚀 S/R Trading Bot Started!")
-        logger.info(f"⏱️  Analysis interval: Every 30 minutes")
-        logger.info(f"📊 Tracking top {TOP_N_COINS} coins")
+        # Startup banner
+        logger.info("\n" + "="*60)
+        logger.info("🚀 S/R TRADING BOT STARTED!")
+        logger.info("="*60)
+        logger.info(f"⏱️  Analysis Interval: Every 30 minutes")
+        logger.info(f"📊 Timeframe: 30min candles")
+        logger.info(f"📈 Candles per analysis: {CANDLES_FOR_ANALYSIS}")
+        logger.info(f"🎯 S/R Zone Width: {SR_ZONE_PERCENT*100}%")
+        logger.info(f"📊 Chart Candles: {CANDLES_FOR_CHART}")
+        logger.info(f"🔊 Volume Spike Threshold: {MIN_VOLUME_SPIKE}x")
+        logger.info("="*60 + "\n")
         
         try:
             while True:
                 try:
                     await self.analyze_all_symbols()
-                    logger.info(f"✅ Analysis complete. Next run in 30 minutes...")
+                    logger.info(f"⏰ Next analysis in 30 minutes... (at {(datetime.now() + timedelta(minutes=30)).strftime('%H:%M:%S')})\n")
                     await asyncio.sleep(30 * 60)  # 30 minutes
                     
                 except Exception as e:
                     logger.error(f"❌ Error in main loop: {e}")
+                    logger.info("⏳ Retrying in 1 minute...")
                     await asyncio.sleep(60)  # Wait 1 minute on error
         
         except KeyboardInterrupt:
-            logger.info("🛑 Bot stopped by user")
+            logger.info("\n🛑 Bot stopped by user")
         
         finally:
             await self.fetcher.close_session()
+            logger.info("👋 Session closed. Goodbye!")
 
 # ======================== ENTRY POINT ========================
 if __name__ == "__main__":
