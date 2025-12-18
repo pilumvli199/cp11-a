@@ -24,28 +24,28 @@ SR_ZONE_PERCENT = 0.004  # 0.4% zone width
 MIN_TOUCHES_NORMAL = 2  # Normal S/R needs 2-3 touches
 MIN_VOLUME_SPIKE = 1.5  # 1.5x average volume for confirmation
 
-# Top 20 coins for analysis (Deribit perpetual format)
+# Top 20 coins for analysis (Deribit format - mix of BTC-settled and USDC-settled perpetuals)
 TOP_COINS = [
-    "BTC-PERPETUAL",      # Bitcoin
-    "ETH-PERPETUAL",      # Ethereum
-    "SOL-PERPETUAL",      # Solana
-    "XRP-PERPETUAL",      # Ripple
-    "BNB-PERPETUAL",      # Binance Coin
-    "ADA-PERPETUAL",      # Cardano
-    "AVAX-PERPETUAL",     # Avalanche
-    "DOGE-PERPETUAL",     # Dogecoin
-    "MATIC-PERPETUAL",    # Polygon
-    "LTC-PERPETUAL",      # Litecoin
-    "LINK-PERPETUAL",     # Chainlink
-    "DOT-PERPETUAL",      # Polkadot
-    "UNI-PERPETUAL",      # Uniswap
-    "ATOM-PERPETUAL",     # Cosmos
-    "MANA-PERPETUAL",     # Decentraland
-    "APE-PERPETUAL",      # ApeCoin
-    "FTM-PERPETUAL",      # Fantom
-    "SUI-PERPETUAL",      # Sui
-    "TRX-PERPETUAL",      # Tron
-    "BCH-PERPETUAL"       # Bitcoin Cash
+    "BTC-PERPETUAL",      # Bitcoin (BTC-settled)
+    "ETH-PERPETUAL",      # Ethereum (BTC-settled)
+    "SOL_USDC-PERPETUAL", # Solana (USDC-settled)
+    "XRP_USDC-PERPETUAL", # Ripple (USDC-settled)
+    "BNB_USDC-PERPETUAL", # Binance Coin (USDC-settled)
+    "ADA_USDC-PERPETUAL", # Cardano (USDC-settled)
+    "DOGE_USDC-PERPETUAL",# Dogecoin (USDC-settled)
+    "MATIC_USDC-PERPETUAL",# Polygon (USDC-settled)
+    "LTC_USDC-PERPETUAL", # Litecoin (USDC-settled)
+    "LINK_USDC-PERPETUAL",# Chainlink (USDC-settled)
+    "DOT_USDC-PERPETUAL", # Polkadot (USDC-settled)
+    "UNI_USDC-PERPETUAL", # Uniswap (USDC-settled)
+    "TRX_USDC-PERPETUAL", # Tron (USDC-settled)
+    "AVAX_USDC-PERPETUAL",# Avalanche (USDC-settled)
+    "NEAR_USDC-PERPETUAL",# NEAR Protocol (USDC-settled)
+    "BCH-PERPETUAL",      # Bitcoin Cash
+    "ALGO_USDC-PERPETUAL",# Algorand (USDC-settled)
+    "FTM_USDC-PERPETUAL", # Fantom (USDC-settled)
+    "APE_USDC-PERPETUAL", # ApeCoin (USDC-settled)
+    "MANA_USDC-PERPETUAL" # Decentraland (USDC-settled)
 ]
 
 # Logging setup
@@ -619,3 +619,4 @@ class SRTradingBot:
 if __name__ == "__main__":
     bot = SRTradingBot()
     asyncio.run(bot.run())
+    
